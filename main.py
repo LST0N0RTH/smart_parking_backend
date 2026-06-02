@@ -97,6 +97,41 @@ def get_current_user(credentials=Depends(bearer), db: Session = Depends(get_db))
         raise HTTPException(status_code=401, detail="User not found")
     return user
 
+# 🌟 ระบบสแกนยกเลิกการจองอัตโนมัติ (No-Show)
+async def auto_cancel_no_shows():
+    while True:
+        await asyncio.sleep(60)  # ให้ระบบตื่นขึ้นมาเช็กทุกๆ 1 นาที
+        try:
+            db = next(get_db())
+            # กำหนดเวลาปัจจุบันลบออก 30 นาที (เพื่อหาบิลที่เลยกำหนดมาแล้ว)
+            cutoff_time = datetime.utcnow() - timedelta(minutes=30)
+            
+            # ค้นหา Booking ที่เลยเวลาเข้าจอดมาแล้ว 30 นาที และ Slot ยังคงค้างอยู่ที่สถานะ reserved
+            expired_bookings = db.query(Booking).join(Slot).filter(
+                Booking.start_time <= cutoff_time,
+                Slot.status == SlotStatus.reserved
+            ).all()
+            
+            for booking in expired_bookings:
+                slot = booking.slot
+                slot.status = SlotStatus.available # คืนสถานะช่องจอดเป็นว่าง
+                
+                # ลบการจองที่หมดเวลาออก (หรือเหนือจะเปลี่ยนสถานะเป็น 'cancelled' ก็ได้)
+                db.delete(booking) 
+                db.commit()
+                
+                # พ่นคำสั่งสั่งบอร์ด ESP32 ให้เปลี่ยนสถานะไฟเป็นว่าง
+                mqtt_client.publish(
+                    f"parking/slot/{slot.name}/command",
+                    json.dumps({"slot": slot.name, "status": "available"})
+                )
+                # แจ้งเตือนแอปหน้าบ้านผ่าน WebSocket
+                await broadcast({"slot": slot.name, "status": "available"})
+                print(f"⏰ Auto-cancelled: Booking ID {booking.id} due to 30-mins no-show.")
+                
+        except Exception as e:
+            print(f"Background task error: {e}")
+
 # ==============================
 # AUTH & USERS
 # ==============================
@@ -161,9 +196,12 @@ def get_slot(slot_id: int, db: Session = Depends(get_db)):
 # ---- ค่าจอดรถ ----
 RATE_PER_HOUR = 45
 MIN_CHARGE    = 45   # ขั้นต่ำ 45 บาท
+DAILY_RATE    = 360  # เหมาจ่ายรายวันเมื่อจองตั้งแต่ 8 ชั่วโมงขึ้นไป
 
 def calculate_amount(start: datetime, end: datetime) -> int:
     hours = (end - start).total_seconds() / 3600
+    if hours >= 8:
+        return DAILY_RATE
     amount = max(MIN_CHARGE, round(hours * RATE_PER_HOUR))
     return amount
 
@@ -311,3 +349,8 @@ async def ws_slots(websocket: WebSocket, db: Session = Depends(get_db)):
             await websocket.receive_text()
     except WebSocketDisconnect:
         connected_clients.remove(websocket)
+
+@app.on_event("startup")
+async def startup_event():
+    # สั่งให้ระบบยกเลิกอัตโนมัติทำงานเบื้องหลังทันทีที่เปิดเซิร์ฟเวอร์
+    asyncio.create_task(auto_cancel_no_shows())
