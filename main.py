@@ -196,7 +196,7 @@ def get_slot(slot_id: int, db: Session = Depends(get_db)):
 # ---- ค่าจอดรถ ----
 RATE_PER_HOUR = 45
 MIN_CHARGE    = 45   # ขั้นต่ำ 45 บาท
-DAILY_RATE    = 360  # เหมาจ่ายรายวันเมื่อจองตั้งแต่ 8 ชั่วโมงขึ้นไป
+DAILY_RATE    = 450  # เหมาจ่ายรายวันเมื่อจองตั้งแต่ 8 ชั่วโมงขึ้นไป
 
 def calculate_amount(start: datetime, end: datetime) -> int:
     hours = (end - start).total_seconds() / 3600
