@@ -196,14 +196,31 @@ def get_slot(slot_id: int, db: Session = Depends(get_db)):
 # ---- ค่าจอดรถ ----
 RATE_PER_HOUR = 45
 MIN_CHARGE    = 45   # ขั้นต่ำ 45 บาท
-DAILY_RATE    = 450  # เหมาจ่ายรายวันเมื่อจองตั้งแต่ 8 ชั่วโมงขึ้นไป
+DAILY_RATE    = 450  # เหมาจ่ายรายวันเมื่อจองตั้งแต่ 8 ชั่วโมงขึ้นไปต่อวัน
 
 def calculate_amount(start: datetime, end: datetime) -> int:
-    hours = (end - start).total_seconds() / 3600
-    if hours >= 8:
-        return DAILY_RATE
-    amount = max(MIN_CHARGE, round(hours * RATE_PER_HOUR))
-    return amount
+    # 1. หาจำนวนชั่วโมงรวมทั้งหมดก่อน
+    total_hours = (end - start).total_seconds() / 3600
+    
+    # 🌟 เคสพิเศษ: ถ้ารวมแล้วไม่ถึง 8 ชั่วโมง ให้คิดราคาชั่วโมงปกติเพียวๆ ไปเลย
+    if total_hours < 8:
+        return max(MIN_CHARGE, round(total_hours * RATE_PER_HOUR))
+        
+    # 2. ตัดแบ่งหาจำนวน "วันเต็มๆ" และ "เศษชั่วโมงที่เหลือ"
+    full_days = int(total_hours // 24)       # จำนวนวัน (เช่น 26 ชั่วโมง จะได้ 1 วัน)
+    remaining_hours = total_hours % 24       # เศษชั่วโมงที่เกินมา (เช่น 26 ชั่วโมง เศษคือ 2 ชั่วโมง)
+    
+    # 3. คำนวณเงินจากเศษชั่วโมงที่เกินมา
+    remaining_charge = 0
+    if remaining_hours > 0:
+        if remaining_hours >= 8:
+            remaining_charge = DAILY_RATE    # ถ้าเศษเกิน 8 ชั่วโมง ปัดเป็นราคาเหมาวันใหม่
+        else:
+            remaining_charge = max(MIN_CHARGE, round(remaining_hours * RATE_PER_HOUR)) # ถ้าไม่ถึง คิดรายชั่วโมง
+            
+    # 4. มัดรวมเงินค่าจอด: (จำนวนวัน x 450) + เงินเศษชั่วโมงที่เกินมา
+    total_amount = (full_days * DAILY_RATE) + remaining_charge
+    return total_amount
 
 # ---- แก้ create_booking ให้คำนวณราคาและสร้าง Payment อัตโนมัติ ----
 @app.post("/bookings", response_model=BookingOut)
