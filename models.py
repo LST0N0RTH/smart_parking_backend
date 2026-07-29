@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Boolean
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from database import Base
@@ -19,6 +19,10 @@ class User(Base):
     license_plate   = Column(String, nullable=True)
     created_at      = Column(DateTime(timezone=True), server_default=func.now())
 
+    username        = Column(String, unique=True, index=True, nullable=True) # สำหรับให้ Admin ล็อกอิน
+    role            = Column(String, default="user") 
+    is_active       = Column(Boolean, default=True) 
+
     bookings = relationship("Booking", back_populates="user")
 
 
@@ -36,25 +40,21 @@ class Booking(Base):
     __tablename__ = "bookings"
 
     id            = Column(Integer, primary_key=True, index=True)
-    user_id       = Column(Integer, ForeignKey("users.id"), nullable=False)
-    slot_id       = Column(Integer, ForeignKey("slots.id"), nullable=False)
+    user_id       = Column(Integer, ForeignKey("users.id"), nullable=False, index=True) 
+    slot_id       = Column(Integer, ForeignKey("slots.id"), nullable=False, index=True) 
     license_plate = Column(String, nullable=True)
     start_time    = Column(DateTime(timezone=True), nullable=False)
     end_time      = Column(DateTime(timezone=True), nullable=False)
-    status        = Column(String, default="active")
+    status        = Column(String, default="active", index=True)
     total_amount  = Column(Integer, default=0)  
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
-
-    user    = relationship("User",    back_populates="bookings")
-    slot    = relationship("Slot",    back_populates="bookings")
-    payment = relationship("Payment", back_populates="booking", uselist=False)
 
 
 class Payment(Base):
     __tablename__ = "payments"
 
     id         = Column(Integer, primary_key=True, index=True)
-    booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=False)
+    booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=False, index=True)
     amount     = Column(Integer, nullable=False)         
     method     = Column(String,  default="promptpay")     
     status     = Column(String,  default="pending")      

@@ -1,4 +1,4 @@
-from pydantic import BaseModel, EmailStr
+from pydantic import BaseModel, EmailStr, ConfigDict
 from datetime import datetime
 from typing import Optional
 from models import SlotStatus
@@ -18,10 +18,9 @@ class UserOut(BaseModel):
     id: int
     name: str
     email: str
-    license_plate: Optional[str]
+    license_plate: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class Token(BaseModel):
     access_token: str
@@ -36,8 +35,7 @@ class SlotOut(BaseModel):
     name: str
     status: SlotStatus
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class BookingCreate(BaseModel):
     slot_id: int
@@ -46,31 +44,29 @@ class BookingCreate(BaseModel):
     license_plate: str
     
 class PaymentOut(BaseModel):
-    id        : int
-    amount    : int
-    method    : str
-    status    : str
-    paid_at   : Optional[datetime]
+    id: int
+    amount: int
+    method: str
+    status: str
+    paid_at: Optional[datetime] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 class PaymentCreate(BaseModel):
-    booking_id : int
-    method     : str = "promptpay"  
+    booking_id: int
+    method: str = "promptpay"  
 
 class BookingOut(BaseModel):
-    id            : int
-    slot_id       : int
-    license_plate : Optional[str]
-    start_time    : datetime
-    end_time      : datetime
-    status        : str
-    total_amount  : int
-    created_at    : datetime
-    slot          : SlotOut
-    user          : UserOut
-    payment       : Optional[PaymentOut] 
+    id: int
+    slot_id: int
+    license_plate: Optional[str] = None
+    start_time: datetime
+    end_time: datetime
+    status: str
+    total_amount: int
+    created_at: datetime
+    slot: SlotOut
+    user: UserOut
+    payment: Optional[PaymentOut] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
