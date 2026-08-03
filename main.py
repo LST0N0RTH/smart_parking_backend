@@ -10,24 +10,30 @@ from dotenv import load_dotenv
 from contextlib import asynccontextmanager
 import paho.mqtt.client as mqtt
 import json, os, asyncio
-
+from pydantic import BaseModel
 from database import get_db, engine, SessionLocal
-from models import Base, User, Slot, Booking, SlotStatus, Payment
+from models import Base, User, Slot, Booking, SlotStatus, Payment 
 from schemas import (
     UserCreate, UserOut, Token, LoginForm,
     SlotOut, BookingCreate, BookingOut, UserUpdate,
     PaymentCreate, PaymentOut
 )
 
+try:
+    from models import DeviceStatus, HardwareLog
+except ImportError:
+    DeviceStatus = None
+    HardwareLog = None
+
 load_dotenv()
 Base.metadata.create_all(bind=engine)
 # ==============================
 # BACKGROUND TASKS & LIFESPAN
 # ==============================
-# 🌟 ระบบสแกนยกเลิกการจองอัตโนมัติ (No-Show)
+# 🌟 ระบบสแกนยกเลิกการจองอัตโนมัติ
 async def auto_cancel_no_shows():
     while True:
-        await asyncio.sleep(30) # ตื่นขึ้นมาเช็กทุกๆ 30 วินาที
+        await asyncio.sleep(30) # ตรวจสอบทุก 30 วินาที
         db = SessionLocal()
         try:
             cutoff_time = datetime.utcnow() - timedelta(minutes=30) # กำหนดเข้าจอดช้าได้ไม่เกิน 30 นาที
@@ -152,6 +158,11 @@ def get_current_user(credentials=Depends(bearer), db: Session = Depends(get_db))
         raise HTTPException(status_code=401, detail="User not found")
     return user
 
+def get_current_admin(current_user: User = Depends(get_current_user)):
+    if current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="ไม่มีสิทธิ์เข้าถึงส่วนผู้ดูแลระบบ")
+    return current_user
+
 # ==============================
 # USERS ROUTES
 # ==============================
@@ -189,8 +200,8 @@ def update_profile(body: UserUpdate,
     if body.license_plate is not None:
         current_user.license_plate = body.license_plate
     if body.password is not None:
-        if len(body.password) < 6:
-            raise HTTPException(400, "รหัสผ่านต้องมีอย่างน้อย 6 ตัว")
+        if len(body.password) < 8:
+            raise HTTPException(400, "รหัสผ่านต้องมีอย่างน้อย 8 ตัว")
         current_user.hashed_password = hash_password(body.password)
     
     db.commit()
@@ -396,3 +407,136 @@ async def ws_slots(websocket: WebSocket):
             await websocket.receive_text()
     except WebSocketDisconnect:
         connected_clients.remove(websocket)
+
+# ==============================
+# ADMIN ROUTES
+# ==============================
+class AdminLoginReq(BaseModel):
+    username: str
+    password: str
+
+class AdminAddReq(BaseModel):
+    first_name: str
+    last_name: str
+    username: str
+    password: str
+
+class ServoOverrideReq(BaseModel):
+    action: str
+
+@app.post("/admin/login")
+def admin_login(body: AdminLoginReq, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.username == body.username, User.role == "admin").first()
+    if not user or not verify_password(body.password, user.hashed_password):
+        raise HTTPException(401, "Invalid username or password")
+    
+    # อัปเดตสถานะ
+    user.is_active = True
+    db.commit()
+
+    token = create_token({"sub": str(user.id)})
+    return {"role": "admin", "access_token": token}
+
+@app.get("/admin/list")
+def get_admin_list(current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    admins = db.query(User).filter(User.role == "admin").all()
+    return [
+        {
+            "is_active": admin.is_active,
+            "name": admin.name,
+            "username": admin.username,
+            "created_at": admin.created_at.strftime("%Y-%m-%d %H:%M") if admin.created_at else "-"
+        }
+        for admin in admins
+    ]
+
+@app.post("/admin/add")
+def add_admin(body: AdminAddReq, current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    existing = db.query(User).filter(User.username == body.username).first()
+    if existing:
+        raise HTTPException(400, "Username already exists")
+    
+    new_admin = User(
+        name=f"{body.first_name} {body.last_name}",
+        username=body.username,
+        email=f"{body.username}@admin.local", 
+        hashed_password=hash_password(body.password),
+        role="admin",
+        is_active=False
+    )
+    db.add(new_admin)
+    db.commit()
+    return {"message": "Admin added successfully"}
+
+@app.get("/admin/analytics")
+def get_analytics(current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    today = datetime.utcnow().date()
+    
+    # คำนวณรายได้รายวัน
+    payments = db.query(Payment).filter(Payment.status == "paid").all()
+    daily_income = sum(p.amount for p in payments if p.paid_at and p.paid_at.date() == today)
+
+    # คำนวณ % การเข้าใช้งานพื้นที่
+    total_slots = db.query(Slot).count()
+    occupied_slots = db.query(Slot).filter(Slot.status != SlotStatus.available).count()
+    usage_percent = round((occupied_slots / total_slots) * 100, 1) if total_slots > 0 else 0.0
+
+    # นับจำนวนรถเข้า-ออก
+    all_bookings = db.query(Booking).all()
+    cars_in = sum(1 for b in all_bookings if b.start_time and b.start_time.date() == today)
+    cars_out = sum(1 for b in all_bookings if b.status == "completed" and b.end_time.date() == today)
+    in_out_count = f"{cars_in} / {cars_out} คัน"
+
+    # สร้างกราฟสถิติ 7 วันย้อนหลัง
+    weekly_chart = []
+    for i in range(6, -1, -1):
+        target_date = today - timedelta(days=i)
+        day_income = sum(p.amount for p in payments if p.paid_at and p.paid_at.date() == target_date)
+        weekly_chart.append({"label": target_date.strftime("%a"), "value": float(day_income)})
+
+    return {
+        "daily_income": daily_income,
+        "usage_percent": usage_percent,
+        "in_out_count": in_out_count,
+        "weekly_chart": weekly_chart
+    }
+
+@app.get("/admin/bookings")
+def get_all_bookings_admin(current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    # ดึงประวัติจอดรถทั้งหมด (Admin Only)
+    return db.query(Booking).order_by(Booking.created_at.desc()).all()
+
+@app.get("/admin/hardware-logs")
+def get_hardware_logs(current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    if HardwareLog is None:
+        return []
+    logs = db.query(HardwareLog).order_by(HardwareLog.created_at.desc()).limit(50).all()
+    return [
+        {
+            "device": log.device_name,
+            "status": log.status,
+            "time": log.created_at.strftime("%H:%M:%S") if log.created_at else "-",
+            "detail": log.detail
+        } for log in logs
+    ]
+
+@app.post("/admin/override/servo")
+def manual_override_servo(body: ServoOverrideReq, current_admin: User = Depends(get_current_admin), db: Session = Depends(get_db)):
+    if body.action not in ["open", "close"]:
+        raise HTTPException(400, "Invalid action")
+    mqtt_client.publish("parking/servo/command", json.dumps({"device": "servo_motor", "action": body.action}))
+
+    # บันทึกประวัติแทรกแซงลง Database
+    if HardwareLog and DeviceStatus:
+        servo_status = db.query(DeviceStatus).filter(DeviceStatus.device_name == "servo_motor").first()
+        if not servo_status:
+            servo_status = DeviceStatus(device_name="servo_motor", status=body.action)
+            db.add(servo_status)
+        else:
+            servo_status.status = body.action
+        
+        log = HardwareLog(device_name="servo_motor", status=body.action, detail=f"Manual override by {current_admin.username}")
+        db.add(log)
+        db.commit()
+
+    return {"message": f"Servo motor set to {body.action}"}

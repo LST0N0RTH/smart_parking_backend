@@ -10,7 +10,7 @@ class SlotStatus(str, enum.Enum):
     reserved  = "reserved"
 
 class User(Base):
-    __tablename__ = "users"
+    __tablename__ = "Users"
 
     id              = Column(Integer, primary_key=True, index=True)
     name            = Column(String, nullable=False)
@@ -27,7 +27,7 @@ class User(Base):
 
 
 class Slot(Base):
-    __tablename__ = "slots"
+    __tablename__ = "Slots"
 
     id     = Column(Integer, primary_key=True, index=True)
     name   = Column(String, unique=True, nullable=False)
@@ -37,7 +37,7 @@ class Slot(Base):
 
 
 class Booking(Base):
-    __tablename__ = "bookings"
+    __tablename__ = "Bookings"
 
     id            = Column(Integer, primary_key=True, index=True)
     user_id       = Column(Integer, ForeignKey("users.id"), nullable=False, index=True) 
@@ -51,7 +51,7 @@ class Booking(Base):
 
 
 class Payment(Base):
-    __tablename__ = "payments"
+    __tablename__ = "Payments"
 
     id         = Column(Integer, primary_key=True, index=True)
     booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=False, index=True)
@@ -62,3 +62,21 @@ class Payment(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
     booking = relationship("Booking", back_populates="payment")
+
+class DeviceStatus(Base):
+    __tablename__ = "Devices"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    device_name  = Column(String, unique=True, nullable=False, index=True)
+    status       = Column(String, nullable=False)
+    last_updated = Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now())
+
+
+class HardwareLog(Base):
+    __tablename__ = "Hardwares"
+
+    id          = Column(Integer, primary_key=True, index=True)
+    device_name = Column(String, nullable=False, index=True)
+    status      = Column(String, nullable=False)
+    detail      = Column(String, nullable=True)
+    created_at  = Column(DateTime(timezone=True), server_default=func.now())

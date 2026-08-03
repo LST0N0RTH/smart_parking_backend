@@ -70,3 +70,27 @@ class BookingOut(BaseModel):
     payment: Optional[PaymentOut] = None
 
     model_config = ConfigDict(from_attributes=True)
+
+class DeviceStatusOut(BaseModel):
+    device_name: str
+    status: str
+    last_updated: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+class HardwareLogOut(BaseModel):
+    id: int
+    device_name: str
+    status: str
+    detail: Optional[str] = None
+    created_at: datetime
+    model_config = ConfigDict(from_attributes=True)
+
+class ChartData(BaseModel):
+    label: str
+    value: float
+
+class AnalyticsOut(BaseModel):
+    daily_income: int
+    usage_percent: float
+    in_out_count: str
+    weekly_chart: list[ChartData]
