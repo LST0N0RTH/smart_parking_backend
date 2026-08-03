@@ -50,6 +50,10 @@ class Booking(Base):
     total_amount  = Column(Integer, default=0)  
     created_at    = Column(DateTime(timezone=True), server_default=func.now())
 
+    user = relationship("User", back_populates="bookings")
+    slot = relationship("Slot", back_populates="bookings")
+    payment = relationship("Payment", back_populates="booking")
+
 
 class Payment(Base):
     __tablename__ = "payments"
