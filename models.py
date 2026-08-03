@@ -4,13 +4,14 @@ from sqlalchemy.sql import func
 from database import Base
 import enum
 
+
 class SlotStatus(str, enum.Enum):
     available = "available"
     occupied  = "occupied"
     reserved  = "reserved"
 
 class User(Base):
-    __tablename__ = "Users"
+    __tablename__ = "users"
 
     id              = Column(Integer, primary_key=True, index=True)
     name            = Column(String, nullable=False)
@@ -19,15 +20,15 @@ class User(Base):
     license_plate   = Column(String, nullable=True)
     created_at      = Column(DateTime(timezone=True), server_default=func.now())
 
-    username        = Column(String, unique=True, index=True, nullable=True) # สำหรับให้ Admin ล็อกอิน
+    username        = Column(String, unique=True, index=True, nullable=True)
     role            = Column(String, default="user") 
     is_active       = Column(Boolean, default=True) 
 
-    bookings = relationship("Booking", back_populates="user")
+    bookings = relationship("Booking", back_populates="users")
 
 
 class Slot(Base):
-    __tablename__ = "Slots"
+    __tablename__ = "slots"
 
     id     = Column(Integer, primary_key=True, index=True)
     name   = Column(String, unique=True, nullable=False)
@@ -37,7 +38,7 @@ class Slot(Base):
 
 
 class Booking(Base):
-    __tablename__ = "Bookings"
+    __tablename__ = "bookings"
 
     id            = Column(Integer, primary_key=True, index=True)
     user_id       = Column(Integer, ForeignKey("users.id"), nullable=False, index=True) 
@@ -51,7 +52,7 @@ class Booking(Base):
 
 
 class Payment(Base):
-    __tablename__ = "Payments"
+    __tablename__ = "payments"
 
     id         = Column(Integer, primary_key=True, index=True)
     booking_id = Column(Integer, ForeignKey("bookings.id"), nullable=False, index=True)
@@ -64,7 +65,7 @@ class Payment(Base):
     booking = relationship("Booking", back_populates="payment")
 
 class DeviceStatus(Base):
-    __tablename__ = "Devices"
+    __tablename__ = "devices"
 
     id           = Column(Integer, primary_key=True, index=True)
     device_name  = Column(String, unique=True, nullable=False, index=True)
@@ -73,7 +74,7 @@ class DeviceStatus(Base):
 
 
 class HardwareLog(Base):
-    __tablename__ = "Hardwares"
+    __tablename__ = "hardwares"
 
     id          = Column(Integer, primary_key=True, index=True)
     device_name = Column(String, nullable=False, index=True)
