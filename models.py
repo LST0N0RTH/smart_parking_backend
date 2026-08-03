@@ -24,7 +24,7 @@ class User(Base):
     role            = Column(String, default="user") 
     is_active       = Column(Boolean, default=True) 
 
-    bookings = relationship("Booking", back_populates="users")
+    bookings = relationship("Booking", back_populates="user")
 
 
 class Slot(Base):
