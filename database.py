@@ -2,10 +2,7 @@ import os
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-if not DATABASE_URL:
-    DATABASE_URL = "postgresql://usashent@localhost/smart_parking"
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://usashent@localhost/smart_parking")
 
 if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)

@@ -18,6 +18,7 @@ from schemas import (
     SlotOut, BookingCreate, BookingOut, UserUpdate,
     PaymentCreate, PaymentOut
 )
+from sqlalchemy import text
 
 try:
     from models import DeviceStatus, HardwareLog
@@ -26,25 +27,124 @@ except ImportError:
     HardwareLog = None
 
 load_dotenv()
+def migrate_existing_users_table() -> None:
+    """
+    ปรับตาราง users เดิมให้ตรงกับ User model ปัจจุบัน
+    เพิ่มข้อมูลเท่าที่ขาดเท่านั้น และไม่ลบข้อมูลเดิม
+    """
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                """
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS username VARCHAR
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS role VARCHAR
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                ALTER TABLE users
+                ADD COLUMN IF NOT EXISTS is_active BOOLEAN
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                UPDATE users
+                SET role = 'user'
+                WHERE role IS NULL
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                UPDATE users
+                SET is_active = TRUE
+                WHERE is_active IS NULL
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                ALTER TABLE users
+                ALTER COLUMN role SET DEFAULT 'user'
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                ALTER TABLE users
+                ALTER COLUMN role SET NOT NULL
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                ALTER TABLE users
+                ALTER COLUMN is_active SET DEFAULT TRUE
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                ALTER TABLE users
+                ALTER COLUMN is_active SET NOT NULL
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ix_users_username
+                ON users (username)
+                """
+            )
+        )
+migrate_existing_users_table()
 Base.metadata.create_all(bind=engine)
+
 # ==============================
 # BACKGROUND TASKS & LIFESPAN
 # ==============================
 # 🌟 ระบบสแกนยกเลิกการจองอัตโนมัติ
 async def auto_cancel_no_shows():
     while True:
-        await asyncio.sleep(30) # ตรวจสอบทุก 30 วินาที
+        await asyncio.sleep(30)
         db = SessionLocal()
         try:
-            cutoff_time = datetime.utcnow() - timedelta(minutes=30) # กำหนดเข้าจอดช้าได้ไม่เกิน 30 นาที
-            expired_bookings = db.query(Booking).join(Slot).filter( # หาการจองที่เลยเวลาเข้าจอดมาแล้ว 30 นาที และช่องจอดยังคงค้างอยู่ที่สถานะจองแล้ว
+            cutoff_time = datetime.utcnow() - timedelta(minutes=30) 
+            expired_bookings = db.query(Booking).join(Slot).filter( 
                 Booking.start_time <= cutoff_time,
                 Slot.status == SlotStatus.reserved
             ).all()
             
             for booking in expired_bookings:
                 slot = booking.slot
-                slot.status = SlotStatus.available # คืนสถานะช่องจอด
+                slot.status = SlotStatus.available
                 
                 db.delete(booking) 
                 db.commit()
@@ -226,8 +326,8 @@ def get_slot(slot_id: int, db: Session = Depends(get_db)):
 # BOOKINGS ROUTES
 # ==============================
 RATE_PER_HOUR = 25
-MIN_CHARGE    = 25  # ชั่วโมงละ 25 บาท
-DAILY_RATE    = 250 # เหมาจ่ายรายวันเมื่อจองตั้งแต่ 8 ชั่วโมงขึ้นไปต่อวัน
+MIN_CHARGE    = 25  
+DAILY_RATE    = 250 
 
 def calculate_amount(start: datetime, end: datetime) -> int:
     total_hours = (end - start).total_seconds() / 3600 # หาจำนวนชั่วโมงรวมทั้งหมด
@@ -526,7 +626,6 @@ def manual_override_servo(body: ServoOverrideReq, current_admin: User = Depends(
         raise HTTPException(400, "Invalid action")
     mqtt_client.publish("parking/servo/command", json.dumps({"device": "servo_motor", "action": body.action}))
 
-    # บันทึกประวัติแทรกแซงลง Database
     if HardwareLog and DeviceStatus:
         servo_status = db.query(DeviceStatus).filter(DeviceStatus.device_name == "servo_motor").first()
         if not servo_status:

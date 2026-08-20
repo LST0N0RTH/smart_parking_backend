@@ -30,7 +30,7 @@ def get_current_admin(current_user: models.User = Depends(get_current_user)):
     if current_user.role != "admin":
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, 
-            detail="บัญชีนี้ไม่มีสิทธิ์เข้าถึงฟีเจอร์นี้"
+            detail="บัญชีนี้ไม่มีสิทธิ์เข้าถึงส่วนผู้ดูแลระบบ"
         )
     return current_user\
     
