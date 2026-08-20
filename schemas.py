@@ -1,25 +1,43 @@
-from pydantic import BaseModel, EmailStr, ConfigDict
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 from datetime import datetime
-from typing import Optional
+from typing import List, Optional
 from models import SlotStatus
+
+class VehicleInput(BaseModel):
+    plate_number: str
+    province: str
+
+    @field_validator("plate_number", "province")
+    @classmethod
+    def value_must_not_be_blank(cls, value: str) -> str:
+        cleaned_value = value.strip()
+        if not cleaned_value:
+            raise ValueError("Vehicle information must not be blank")
+        return cleaned_value
+
+class VehicleOut(VehicleInput):
+    id: int
+    model_config = ConfigDict(from_attributes=True)
 
 class UserCreate(BaseModel):
     name: str
     email: EmailStr
     password: str
     license_plate: Optional[str] = None
+    vehicles: Optional[List[VehicleInput]] = None
 
 class UserUpdate(BaseModel):
     name: Optional[str] = None
-    license_plate: Optional[str] = None
     password: Optional[str] = None
+    license_plate: Optional[str] = None
+    vehicles: Optional[List[VehicleInput]] = None
 
 class UserOut(BaseModel):
     id: int
     name: str
     email: str
     license_plate: Optional[str] = None
-
+    vehicles: List[VehicleOut] = Field(default_factory=list)
     model_config = ConfigDict(from_attributes=True)
 
 class Token(BaseModel):
@@ -34,7 +52,6 @@ class SlotOut(BaseModel):
     id: int
     name: str
     status: SlotStatus
-
     model_config = ConfigDict(from_attributes=True)
 
 class BookingCreate(BaseModel):

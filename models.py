@@ -1,4 +1,13 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, Enum, Boolean
+from sqlalchemy import (
+    Boolean,
+    Column,
+    DateTime,
+    Enum,
+    ForeignKey,
+    Integer,
+    String,
+    UniqueConstraint,
+)
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from database import Base
@@ -25,6 +34,26 @@ class User(Base):
     is_active       = Column(Boolean, default=True) 
 
     bookings = relationship("Booking", back_populates="user")
+    vehicles = relationship("Vehicle", back_populates="user")
+
+class Vehicle(Base):
+    __tablename__ = "vehicles"
+
+    __table_args__ = (
+        UniqueConstraint(
+            "user_id",
+            "plate_number",
+            "province",
+            name="uq_vehicles_user_plate_province",
+        ),
+    )
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    plate_number = Column(String, nullable=False)
+    province = Column(String, nullable=False, default="")
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+
+    user = relationship("User", back_populates="vehicles")
 
 
 class Slot(Base):

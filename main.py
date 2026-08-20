@@ -6,17 +6,17 @@ from datetime import datetime, timedelta, timezone
 from typing import List
 from jose import jwt, JWTError
 from passlib.context import CryptContext
-from dotenv import load_dotenv
+
 from contextlib import asynccontextmanager
 import paho.mqtt.client as mqtt
-import json, os, asyncio
+import json, os, asyncio, logging
 from pydantic import BaseModel
 from database import get_db, engine, SessionLocal
-from models import Base, User, Slot, Booking, SlotStatus, Payment 
+from models import Base, User, Vehicle, Slot, Booking, SlotStatus, Payment
 from schemas import (
     UserCreate, UserOut, Token, LoginForm,
     SlotOut, BookingCreate, BookingOut, UserUpdate,
-    PaymentCreate, PaymentOut
+    PaymentCreate, PaymentOut, VehicleInput,
 )
 from sqlalchemy import text
 
@@ -26,7 +26,8 @@ except ImportError:
     DeviceStatus = None
     HardwareLog = None
 
-load_dotenv()
+logger = logging.getLogger("smart_parking.auth")
+
 def migrate_existing_users_table() -> None:
     """
     ปรับตาราง users เดิมให้ตรงกับ User model ปัจจุบัน
@@ -124,6 +125,89 @@ def migrate_existing_users_table() -> None:
                 """
             )
         )
+
+        connection.execute(
+            text(
+                """
+                CREATE TABLE IF NOT EXISTS vehicles (
+                    id SERIAL PRIMARY KEY,
+                    user_id INTEGER NOT NULL REFERENCES users(id),
+                    plate_number VARCHAR NOT NULL,
+                    province VARCHAR NOT NULL DEFAULT '',
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CONSTRAINT uq_vehicles_user_plate_province
+                        UNIQUE (user_id, plate_number, province)
+                )
+                """
+            )
+        )
+
+        connection.execute(
+            text(
+                """
+                CREATE INDEX IF NOT EXISTS ix_vehicles_user_id
+                ON vehicles (user_id)
+                """
+            )
+        )
+
+        legacy_users = connection.execute(
+            text(
+                """
+                SELECT id, license_plate
+                FROM users
+                WHERE license_plate IS NOT NULL
+                  AND BTRIM(license_plate) <> ''
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM vehicles
+                      WHERE vehicles.user_id = users.id
+                  )
+                """
+            )
+        ).mappings().all()
+
+        for legacy_user in legacy_users:
+            legacy_plates = legacy_user["license_plate"].split(",")
+
+            for legacy_plate in legacy_plates:
+                vehicle_text = legacy_plate.strip()
+                if not vehicle_text:
+                    continue
+
+                parts = vehicle_text.rsplit(maxsplit=1)
+                plate_number = parts[0].strip()
+                province = parts[1].strip() if len(parts) == 2 else ""
+
+                if not plate_number:
+                    continue
+
+                connection.execute(
+                    text(
+                        """
+                        INSERT INTO vehicles (
+                            user_id,
+                            plate_number,
+                            province
+                        )
+                        VALUES (
+                            :user_id,
+                            :plate_number,
+                            :province
+                        )
+                        ON CONFLICT (
+                            user_id,
+                            plate_number,
+                            province
+                        ) DO NOTHING
+                        """
+                    ),
+                    {
+                        "user_id": legacy_user["id"],
+                        "plate_number": plate_number,
+                        "province": province,
+                    },
+                )
 migrate_existing_users_table()
 Base.metadata.create_all(bind=engine)
 
@@ -263,6 +347,103 @@ def get_current_admin(current_user: User = Depends(get_current_user)):
         raise HTTPException(status_code=403, detail="ไม่มีสิทธิ์เข้าถึงส่วนผู้ดูแลระบบ")
     return current_user
 
+MAX_VEHICLES_PER_USER = 5
+
+
+def _vehicle_display(plate_number: str, province: str) -> str:
+    return f"{plate_number} {province}".strip()
+
+
+def _validate_vehicle_specs(
+    vehicle_specs: list[tuple[str, str]],
+) -> list[tuple[str, str]]:
+    if len(vehicle_specs) > MAX_VEHICLES_PER_USER:
+        raise HTTPException(
+            status_code=422,
+            detail="A user may register up to 5 vehicles",
+        )
+
+    normalized_specs: list[tuple[str, str]] = []
+    registered_vehicles: set[tuple[str, str]] = set()
+
+    for plate_number, province in vehicle_specs:
+        cleaned_plate_number = plate_number.strip()
+        cleaned_province = province.strip()
+        if not cleaned_plate_number:
+            raise HTTPException(
+                status_code=422,
+                detail="Vehicle plate number is required",
+            )
+        vehicle_key = (
+            cleaned_plate_number.casefold(),
+            cleaned_province.casefold(),
+        )
+        if vehicle_key in registered_vehicles:
+            raise HTTPException(
+                status_code=422,
+                detail="Duplicate vehicle information",
+            )
+        registered_vehicles.add(vehicle_key)
+        normalized_specs.append(
+            (cleaned_plate_number, cleaned_province)
+        )
+    return normalized_specs
+
+def _vehicle_specs_from_payload(
+    vehicles: list[VehicleInput],
+) -> list[tuple[str, str]]:
+    return _validate_vehicle_specs(
+        [
+            (vehicle.plate_number, vehicle.province)
+            for vehicle in vehicles
+        ]
+    )
+
+def _vehicle_specs_from_legacy(
+    license_plate: str | None,
+) -> list[tuple[str, str]]:
+    if not license_plate or not license_plate.strip():
+        return []
+    vehicle_specs: list[tuple[str, str]] = []
+    for raw_vehicle in license_plate.split(","):
+        vehicle_text = raw_vehicle.strip()
+        if not vehicle_text:
+            continue
+        parts = vehicle_text.rsplit(maxsplit=1)
+        plate_number = parts[0]
+        province = parts[1] if len(parts) == 2 else ""
+        vehicle_specs.append((plate_number, province))
+    return _validate_vehicle_specs(vehicle_specs)
+
+def _legacy_plate_value(
+    vehicle_specs: list[tuple[str, str]],
+) -> str | None:
+    if not vehicle_specs:
+        return None
+    return ",".join(
+        _vehicle_display(plate_number, province)
+        for plate_number, province in vehicle_specs
+    )
+
+def _replace_user_vehicles(
+    db: Session,
+    user_id: int,
+    vehicle_specs: list[tuple[str, str]],
+) -> None:
+    db.query(Vehicle).filter(Vehicle.user_id == user_id).delete(
+        synchronize_session=False
+    )
+    db.add_all(
+        [
+            Vehicle(
+                user_id=user_id,
+                plate_number=plate_number,
+                province=province,
+            )
+            for plate_number, province in vehicle_specs
+        ]
+    )
+
 # ==============================
 # USERS ROUTES
 # ==============================
@@ -270,40 +451,69 @@ def get_current_admin(current_user: User = Depends(get_current_user)):
 def register(body: UserCreate, db: Session = Depends(get_db)):
     if db.query(User).filter(User.email == body.email).first():
         raise HTTPException(400, "Email already registered")
+    if body.vehicles is None:
+        vehicle_specs = _vehicle_specs_from_legacy(body.license_plate)
+    else:
+        vehicle_specs = _vehicle_specs_from_payload(body.vehicles)
     user = User(
-        name=body.name, email=body.email,
+        name=body.name,
+        email=body.email,
         hashed_password=hash_password(body.password),
-        license_plate=body.license_plate
+        license_plate=_legacy_plate_value(vehicle_specs),
     )
     db.add(user)
+    db.flush()
+    _replace_user_vehicles(db, user.id, vehicle_specs)
     db.commit()
     db.refresh(user)
     return user
 
 @app.post("/auth/login", response_model=Token)
 def login(body: LoginForm, db: Session = Depends(get_db)):
-    user = db.query(User).filter(User.email == body.email).first()
-    if not user or not verify_password(body.password, user.hashed_password):
-        raise HTTPException(401, "Invalid email or password")
-    return {"access_token": create_token({"sub": str(user.id)}), "token_type": "bearer"}
+    try:
+        user = db.query(User).filter(User.email == body.email).first()
+
+        if not user or not verify_password(body.password, user.hashed_password):
+            raise HTTPException(
+                status_code=401,
+                detail="Invalid email or password",
+            )
+        return {
+            "access_token": create_token({"sub": str(user.id)}),
+            "token_type": "bearer",
+        }
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Unexpected error while processing a login request")
+        raise HTTPException(
+            status_code=500,
+            detail="Unable to complete sign-in",
+        )
 
 @app.get("/users/me", response_model=UserOut)
 def get_me(current_user: User = Depends(get_current_user)):
     return current_user
 
 @app.put("/users/me", response_model=UserOut)
-def update_profile(body: UserUpdate,
-                  db: Session = Depends(get_db),
-                  current_user: User = Depends(get_current_user)):
+def update_profile(
+    body: UserUpdate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     if body.name is not None:
-        current_user.name = body.name
-    if body.license_plate is not None:
-        current_user.license_plate = body.license_plate
+        current_user.name = body.name.strip()
+    if body.vehicles is not None:
+        vehicle_specs = _vehicle_specs_from_payload(body.vehicles)
+        _replace_user_vehicles(db, current_user.id, vehicle_specs)
+        current_user.license_plate = _legacy_plate_value(vehicle_specs)
+    elif body.license_plate is not None:
+        vehicle_specs = _vehicle_specs_from_legacy(body.license_plate)
+        _replace_user_vehicles(db, current_user.id, vehicle_specs)
+        current_user.license_plate = _legacy_plate_value(vehicle_specs)
     if body.password is not None:
         if len(body.password) < 8:
             raise HTTPException(400, "รหัสผ่านต้องมีอย่างน้อย 8 ตัว")
-        current_user.hashed_password = hash_password(body.password)
-    
     db.commit()
     db.refresh(current_user)
     return current_user
