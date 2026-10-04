@@ -8,7 +8,13 @@ import models, schemas
 
 router = APIRouter(prefix="/users", tags=["users"])
 
-SECRET_KEY = os.getenv("SECRET_KEY", "your_fallback_secret_key")
+SECRET_KEY = os.getenv("SECRET_KEY")
+
+if not SECRET_KEY or len(SECRET_KEY) < 32:
+    raise RuntimeError(
+        "SECRET_KEY must be configured with at least 32 characters."
+    )
+
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/auth/login")
 
