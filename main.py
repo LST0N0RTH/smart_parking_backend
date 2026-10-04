@@ -803,28 +803,69 @@ async def auto_cancel_no_shows():
     while True:
         await asyncio.sleep(30)
         db = SessionLocal()
+
         try:
-            cutoff_time = datetime.utcnow() - timedelta(minutes=30) 
-            expired_bookings = db.query(Booking).join(Slot).filter( 
-                Booking.start_time <= cutoff_time,
-                Slot.status == SlotStatus.reserved
-            ).all()
-            
+            now = datetime.now(timezone.utc)
+            cutoff_time = now - timedelta(minutes=30)
+
+            expired_bookings = (
+                db.query(Booking)
+                .join(Slot)
+                .filter(
+                    Booking.status == "active",
+                    Booking.start_time <= cutoff_time,
+                    Slot.status == SlotStatus.reserved,
+                )
+                .all()
+            )
+
             for booking in expired_bookings:
                 slot = booking.slot
+                slot_name = slot.name
+
+                booking.status = "time_out"
                 slot.status = SlotStatus.available
-                
-                db.delete(booking) 
-                db.commit()
-                
-                mqtt_client.publish(
-                    f"parking/slot/{slot.name}/command",
-                    json.dumps({"slot": slot.name, "status": "available"})
+
+                payment = (
+                    db.query(Payment)
+                    .filter(Payment.booking_id == booking.id)
+                    .first()
                 )
-                await broadcast({"slot": slot.name, "status": "available"})
-                print(f"⏰ Auto-cancelled: Booking ID {booking.id} due to 30-mins no-show.")
-        except Exception as e:
-            print(f"Background task error: {e}")
+                if payment and payment.status == "pending":
+                    payment.status = "cancelled"
+
+                (
+                    db.query(BookingQrToken)
+                    .filter(
+                        BookingQrToken.booking_id == booking.id,
+                        BookingQrToken.qr_type == "entry",
+                        BookingQrToken.revoked_at.is_(None),
+                        BookingQrToken.used_at.is_(None),
+                    )
+                    .update(
+                        {BookingQrToken.revoked_at: now},
+                        synchronize_session=False,
+                    )
+                )
+                db.commit()
+
+                mqtt_client.publish(
+                    f"parking/slot/{slot_name}/command",
+                    json.dumps(
+                        {"slot": slot_name, "status": "available"}
+                    ),
+                )
+                await broadcast(
+                    {"slot": slot_name, "status": "available"}
+                )
+
+                print(
+                    f"⏰ Booking ID {booking.id} changed to Time Out."
+                )
+
+        except Exception as error:
+            db.rollback()
+            print(f"Background task error: {error}")
         finally:
             db.close()
 
@@ -1345,24 +1386,68 @@ def my_bookings(db: Session = Depends(get_db),
               .all())
 
 @app.delete("/bookings/{booking_id}")
-def cancel_booking(booking_id: int,
-                  db: Session = Depends(get_db),
-                  current_user: User = Depends(get_current_user)):
-    booking = db.query(Booking).filter(
-        Booking.id == booking_id,
-        Booking.user_id == current_user.id
-    ).first()
+def cancel_booking(
+    booking_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    booking = (
+        db.query(Booking)
+        .filter(
+            Booking.id == booking_id,
+            Booking.user_id == current_user.id,
+        )
+        .first()
+    )
+
     if not booking:
         raise HTTPException(404, "Booking not found")
-    
-    booking.slot.status = SlotStatus.available
-    db.delete(booking)
-    db.commit()
-    
-    mqtt_client.publish(
-        f"parking/slot/{booking.slot.name}/command",
-        json.dumps({"slot": booking.slot.name, "status": "available"})
+
+    if booking.status != "active":
+        raise HTTPException(
+            409,
+            "Booking นี้ไม่สามารถยกเลิกได้",
+        )
+
+    now = datetime.now(timezone.utc)
+    slot = booking.slot
+    slot_name = slot.name
+
+    payment = (
+        db.query(Payment)
+        .filter(Payment.booking_id == booking.id)
+        .first()
     )
+    if payment:
+        db.delete(payment)
+
+    (
+        db.query(BookingQrToken)
+        .filter(
+            BookingQrToken.booking_id == booking.id,
+            BookingQrToken.qr_type == "entry",
+            BookingQrToken.revoked_at.is_(None),
+            BookingQrToken.used_at.is_(None),
+        )
+        .update(
+            {BookingQrToken.revoked_at: now},
+            synchronize_session=False,
+        )
+    )
+
+    booking.status = "cancelled"
+    slot.status = SlotStatus.available
+
+    db.commit()
+
+    mqtt_client.publish(
+        f"parking/slot/{slot_name}/command",
+        json.dumps({"slot": slot_name, "status": "available"}),
+    )
+    asyncio.run(
+        broadcast({"slot": slot_name, "status": "available"})
+    )
+
     return {"message": f"Booking {booking_id} cancelled"}
 
 
