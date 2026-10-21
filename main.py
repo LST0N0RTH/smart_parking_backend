@@ -3221,27 +3221,79 @@ def _handle_slot_vision_update(payload: dict) -> None:
     if changed_slots:
         _publish_gate_display_state()
 
+def _replay_slot_states_to_wroom() -> None:
+    slot_states: list[tuple[str, str, str]] = []
+    db = SessionLocal()
+
+    try:
+        now = datetime.now(timezone.utc)
+        valid_statuses = {status.value for status in SlotStatus}
+
+        slots = (
+            db.query(Slot)
+            .filter(Slot.name.in_(("M", "N", "O")))
+            .order_by(Slot.name)
+            .all()
+        )
+
+        for slot in slots:
+            status = slot.status.value
+            source = "backend_sync"
+
+            admin_command = _latest_admin_rgb_command(
+                db,
+                slot.name,
+                now,
+            )
+
+            if admin_command is not None:
+                payload = admin_command.payload or {}
+                admin_status = (
+                    payload.get("status")
+                    if isinstance(payload, dict)
+                    else None
+                )
+
+                if admin_status in valid_statuses:
+                    status = admin_status
+
+                source = admin_command.source
+
+            slot_states.append((slot.name, status, source))
+
+    except Exception:
+        logger.exception(
+            "Unable to prepare RGB state replay for ESP32-WROOM"
+        )
+        return
+    finally:
+        db.close()
+
+    for slot_name, status, source in slot_states:
+        _publish_slot_command(slot_name, status, source=source)
+
 
 def _handle_hardware_heartbeat(payload: dict) -> None:
     device_name = payload.get("device")
     status = payload.get("status")
     detail = payload.get("detail")
     components = payload.get("components", [])
+    sync_requested = payload.get("sync_requested", False)
 
     if (
         device_name not in KNOWN_HARDWARE_DEVICES
         or status not in REPORTED_DEVICE_STATUSES
         or not isinstance(components, list)
+        or not isinstance(sync_requested, bool)
     ):
         logger.warning(
             "Ignoring invalid hardware heartbeat: %s",
             payload,
         )
         return
-
+    
     if not isinstance(detail, str) or not detail.strip():
         detail = f"Heartbeat received from {device_name}"
-
     normalized_components: list[tuple[str, str, str]] = []
 
     for component in components:
@@ -3265,12 +3317,11 @@ def _handle_hardware_heartbeat(payload: dict) -> None:
                 component,
             )
             return
-
+        
         if not isinstance(component_detail, str) or not component_detail.strip():
             component_detail = (
                 f"Heartbeat received through {device_name}"
             )
-
         normalized_components.append(
             (
                 component_name,
@@ -3278,12 +3329,15 @@ def _handle_hardware_heartbeat(payload: dict) -> None:
                 component_detail,
             )
         )
-
+    replay_slot_states = (
+        device_name == "esp32_wroom"
+        and status == "online"
+        and sync_requested
+    )
     db = SessionLocal()
 
     try:
         now = datetime.now(timezone.utc)
-
         _record_device_observation(
             db=db,
             device_name=device_name,
@@ -3291,7 +3345,6 @@ def _handle_hardware_heartbeat(payload: dict) -> None:
             detail=detail,
             now=now,
         )
-
         for component_name, component_status, component_detail in normalized_components:
             _record_device_observation(
                 db=db,
@@ -3300,16 +3353,20 @@ def _handle_hardware_heartbeat(payload: dict) -> None:
                 detail=component_detail,
                 now=now,
             )
-
         db.commit()
+
     except Exception:
         db.rollback()
         logger.exception(
             "Unable to process heartbeat from %s",
             device_name,
         )
+        return
+    
     finally:
         db.close()
+    if replay_slot_states:
+        _replay_slot_states_to_wroom()
 
 def _bangkok_day_start(now: datetime) -> datetime:
     local_date = now.astimezone(ZoneInfo("Asia/Bangkok")).date()
