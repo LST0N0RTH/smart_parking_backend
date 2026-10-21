@@ -1,23 +1,39 @@
-from database import engine, SessionLocal
-from models import Base, Slot
+from sqlalchemy import text
+from database import SessionLocal
+from models import Slot
 
-def init():
-    Base.metadata.create_all(bind=engine)
+REQUIRED_SLOT_NAMES = ("M", "N", "O")
+
+def init() -> None:
+    from main import initialize_database
+
+    initialize_database()
     db = SessionLocal()
-    
+
     try:
-        if db.query(Slot).first() is None:
-            for name in ["M", "N", "O"]:
-                db.add(Slot(name=name))
-            db.commit()
-            print("Created slots: M, N, O")
+        db.execute(text("SELECT pg_advisory_xact_lock(852004721)"))
+        existing_names = {
+            row[0]
+            for row in (
+                db.query(Slot.name)
+                .filter(Slot.name.in_(REQUIRED_SLOT_NAMES))
+                .all()
+            )
+        }
+        missing_names = [
+            name for name in REQUIRED_SLOT_NAMES if name not in existing_names
+        ]
+        for name in missing_names:
+            db.add(Slot(name=name))
+        db.commit()
+
+        if missing_names:
+            print(f"Created missing slots: {', '.join(missing_names)}")
         else:
-            print("Slots already exist")
-            
-    except Exception as e:
+            print("Database is ready; slots M, N, O already exist")
+    except Exception:
         db.rollback()
-        print(f"Error initializing database: {e}")
-        
+        raise
     finally:
         db.close()
 
