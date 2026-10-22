@@ -1667,7 +1667,7 @@ PAYMENT_QR_VALIDITY = timedelta(minutes=15)
 QR_TYPES = {"entry", "payment", "exit"}
 PUBLIC_API_BASE_URL = os.getenv(
     "PUBLIC_API_BASE_URL",
-    "https://tender-mercy-production-0bf1.up.railway.app",
+    "https://coolkids-backend.onrender.com",
 ).rstrip("/")
 SUPPORT_CONTACT_URL = os.getenv("SUPPORT_CONTACT_URL", "").strip()
 
