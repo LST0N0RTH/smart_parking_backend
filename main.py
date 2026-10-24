@@ -1666,7 +1666,7 @@ PAYMENT_QR_VALIDITY = timedelta(minutes=15)
 QR_TYPES = {"entry", "payment", "exit"}
 PUBLIC_API_BASE_URL = os.getenv(
     "PUBLIC_API_BASE_URL",
-    "https://coolkids-backend.onrender.com",
+    "https://smart-parking-backend-h6cm.onrender.com",
 ).rstrip("/")
 SUPPORT_CONTACT_URL = os.getenv("SUPPORT_CONTACT_URL", "").strip()
 
