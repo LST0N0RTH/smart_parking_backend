@@ -17,7 +17,9 @@ import os
 import secrets
 import socket
 import ssl
+from pathlib import Path
 import paho.mqtt.client as mqtt
+from dotenv import load_dotenv
 from html import escape
 from database import get_db, engine, SessionLocal
 from models import (
@@ -40,8 +42,9 @@ from schemas import (
 )
 from sqlalchemy import text, or_, and_, func
 from sqlalchemy.exc import IntegrityError
-
+load_dotenv(Path(__file__).with_name(".env"))
 logger = logging.getLogger("smart_parking.auth")
+
 USER_SCHEMA_MIGRATION_ID = "20260930_001_user_and_vehicle_schema"
 BOOKING_VEHICLE_MIGRATION_ID = "20260930_002_booking_vehicle_reference"
 LEGACY_VEHICLE_PROVINCE_MIGRATION_ID = ("20260930_003_normalize_legacy_vehicle_provinces")
@@ -1418,54 +1421,50 @@ def _mqtt_env_flag(name: str, default: bool = False) -> bool:
         return False
     raise RuntimeError(f"{name} must be true or false")
 
-MQTT_BROKER = os.getenv(
-    "MQTT_BROKER",
-    "localhost",
-).strip() or "localhost"
-
-MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
+MQTT_BROKER = os.getenv("MQTT_BROKER", "").strip()
+if not MQTT_BROKER:
+    raise RuntimeError("MQTT_BROKER must be configured for Render WSS")
+try:
+    MQTT_PORT = int(os.getenv("MQTT_PORT", "443"))
+except ValueError as error:
+    raise RuntimeError("MQTT_PORT must be a number") from error
+if not 1 <= MQTT_PORT <= 65535:
+    raise RuntimeError("MQTT_PORT must be between 1 and 65535")
 
 MQTT_TRANSPORT = os.getenv(
     "MQTT_TRANSPORT",
-    "tcp",
+    "websockets",
 ).strip().lower()
 
-MQTT_TLS = _mqtt_env_flag("MQTT_TLS")
+MQTT_TLS = _mqtt_env_flag("MQTT_TLS", default=True)
 
 MQTT_USERNAME = os.getenv(
     "MQTT_USERNAME",
     "",
 ).strip()
-
 MQTT_PASSWORD = os.getenv(
     "MQTT_PASSWORD",
     "",
 )
-
 MQTT_WEBSOCKET_PATH = os.getenv(
     "MQTT_WEBSOCKET_PATH",
     "/mqtt",
 ).strip() or "/mqtt"
-
 MQTT_CLIENT_ID = os.getenv(
     "MQTT_CLIENT_ID",
     "",
 ).strip() or (
     f"coolkids-backend-{socket.gethostname()}-{os.getpid()}"
 )
-if MQTT_TRANSPORT not in {"tcp", "websockets"}:
-    raise RuntimeError(
-        "MQTT_TRANSPORT must be tcp or websockets"
-    )
+if MQTT_TRANSPORT != "websockets":
+    raise RuntimeError("Coolkids Smart Parking requires MQTT_TRANSPORT=websockets")
+if not MQTT_TLS:
+    raise RuntimeError("Coolkids Smart Parking requires MQTT_TLS=true")
 if bool(MQTT_USERNAME) != bool(MQTT_PASSWORD):
     raise RuntimeError(
         "MQTT_USERNAME and MQTT_PASSWORD must be configured together"
     )
-
-if (
-    MQTT_TRANSPORT == "websockets"
-    and not MQTT_WEBSOCKET_PATH.startswith("/")
-):
+if not MQTT_WEBSOCKET_PATH.startswith("/"):
     raise RuntimeError(
         "MQTT_WEBSOCKET_PATH must start with /"
     )
@@ -3124,6 +3123,14 @@ def _handle_slot_vision_update(payload: dict) -> None:
 
         observed_names.add(slot_name)
         normalized_observations.append((slot_name, occupied))
+        required_slot_names = {"M", "N", "O"}
+    if observed_names != required_slot_names:
+        logger.warning(
+            "Ignoring incomplete Slot Webcam snapshot: expected=%s received=%s",
+            sorted(required_slot_names),
+            sorted(observed_names),
+        )
+        return
 
     changed_slots: list[tuple[str, str]] = []
     db = SessionLocal()
