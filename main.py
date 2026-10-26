@@ -1168,17 +1168,22 @@ async def lifespan(app: FastAPI):
     await asyncio.to_thread(initialize_database)
     slot_broadcast_loop = asyncio.get_running_loop()
 
-    try:
+    def _start_mqtt() -> None:
         mqtt_client.reconnect_delay_set(min_delay=1, max_delay=30)
-        mqtt_client.connect_async(
-            MQTT_BROKER,
-            MQTT_PORT,
-            keepalive=30,
+        logger.info(
+            "MQTT connecting to wss://%s:%s%s as %s",
+            MQTT_BROKER, MQTT_PORT, MQTT_WEBSOCKET_PATH, MQTT_CLIENT_ID,
         )
+        try:
+            mqtt_client.connect(MQTT_BROKER, MQTT_PORT, keepalive=30)
+        except Exception as error:
+            logger.error("MQTT first connect failed: %r", error)
+            mqtt_client.connect_async(MQTT_BROKER, MQTT_PORT, keepalive=30)
         mqtt_client.loop_start()
+    try:
+        await asyncio.to_thread(_start_mqtt)
     except Exception:
         logger.exception("Unable to start MQTT connection; reconnect will be retried")
-
     tasks = [
         asyncio.create_task(auto_cancel_no_shows()),
         asyncio.create_task(monitor_hardware_command_timeouts()),
@@ -1583,6 +1588,7 @@ def _build_mqtt_client() -> mqtt.Client:
     client.on_connect = on_mqtt_connect
     client.on_disconnect = on_mqtt_disconnect
     client.on_message = on_mqtt_message
+    client.on_connect_fail = on_mqtt_connect_fail
     return client
 
 mqtt_client = _build_mqtt_client()
