@@ -1563,6 +1563,13 @@ def on_mqtt_message(client, userdata, msg):
     except Exception:
         logger.exception("MQTT message processing error")
 
+def on_mqtt_connect_fail(client, userdata) -> None:
+    del client, userdata
+    logger.error(
+        "MQTT connect attempt failed (network/TLS/WebSocket) to wss://%s:%s%s",
+        MQTT_BROKER, MQTT_PORT, MQTT_WEBSOCKET_PATH,
+    )
+
 def _build_mqtt_client() -> mqtt.Client:
     client = mqtt.Client(
         callback_api_version=mqtt.CallbackAPIVersion.VERSION2,
@@ -1588,7 +1595,6 @@ def _build_mqtt_client() -> mqtt.Client:
     client.on_connect = on_mqtt_connect
     client.on_disconnect = on_mqtt_disconnect
     client.on_message = on_mqtt_message
-    client.on_connect_fail = on_mqtt_connect_fail
     return client
 
 mqtt_client = _build_mqtt_client()
