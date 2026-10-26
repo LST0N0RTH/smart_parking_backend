@@ -1224,10 +1224,13 @@ if not SECRET_KEY or len(SECRET_KEY) < 32:
     )
 
 ALGORITHM = os.getenv("ALGORITHM", "HS256")
-TOKEN_EXP = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", 60))
-
+TOKEN_EXP = int(
+    os.getenv(
+        "ACCESS_TOKEN_EXPIRE_MINUTES",
+        str(31 * 24 * 60),
+    )
+)
 pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-
 connected_clients: list[WebSocket] = []
 slot_clients_lock = asyncio.Lock()
 slot_broadcast_loop: asyncio.AbstractEventLoop | None = None
@@ -1364,6 +1367,7 @@ def schedule_slot_broadcast(
     future.add_done_callback(log_broadcast_error)
 
 GATE_EVENT_TOPIC = "parking/gate/event"
+GATE_EVENT_ACK_TOPIC = "parking/gate/event/ack"
 HARDWARE_ACK_TOPIC = "parking/hardware/ack"
 HARDWARE_HEARTBEAT_TOPIC = "parking/hardware/heartbeat"
 SLOT_VISION_TOPIC = "parking/slot/vision"
@@ -1582,6 +1586,37 @@ def _build_mqtt_client() -> mqtt.Client:
     return client
 
 mqtt_client = _build_mqtt_client()
+
+def _publish_gate_event_ack(
+    event_id: str,
+    device_name: str,
+) -> None:
+    payload = {
+        "event_id": event_id,
+        "device": device_name,
+        "status": "persisted",
+    }
+    try:
+        result = mqtt_client.publish(
+            GATE_EVENT_ACK_TOPIC,
+            json.dumps(
+                payload,
+                separators=(",", ":"),
+            ),
+            qos=1,
+        )
+        if result.rc != mqtt.MQTT_ERR_SUCCESS:
+            logger.error(
+                "Gate event ACK publish failed: "
+                "event_id=%s result=%s",
+                event_id,
+                result.rc,
+            )
+    except Exception:
+        logger.exception(
+            "Unable to publish Gate event ACK for %s",
+            event_id,
+        )
 
 # ==============================
 # HELPERS & AUTHENTICATION
@@ -1849,14 +1884,11 @@ def _set_slot_status(
     source: str,
     now: datetime,
 ) -> bool:
-    if (
-        not source.startswith("admin:")
-        and _latest_admin_rgb_command(db, slot.name, now) is not None
-    ):
-        return False
     if slot.status == status:
         return False
+
     slot.status = status
+
     db.add(
         SlotStatusLog(
             slot_id=slot.id,
@@ -1865,6 +1897,7 @@ def _set_slot_status(
             recorded_at=now,
         )
     )
+
     return True
 
 def _mark_booking_time_out(
@@ -2145,13 +2178,19 @@ def _record_slot_status(
 ) -> bool:
     return _set_slot_status(db, slot, status, source, now)
 
-def _record_gate_event(payload: dict) -> str | None:
+def _record_gate_event(
+    payload: dict,
+) -> tuple[str, bool] | None:
     device_name = payload.get("device")
     gate = payload.get("gate")
     sensor = payload.get("sensor")
     event = payload.get("event")
+
     if (
-        device_name not in {"esp32_cam", "esp32_cam_exit"}
+        device_name not in {
+            "esp32_cam",
+            "esp32_cam_exit",
+        }
         or not isinstance(gate, str)
         or not gate.strip()
         or not isinstance(sensor, str)
@@ -2159,79 +2198,141 @@ def _record_gate_event(payload: dict) -> str | None:
         or not isinstance(event, str)
         or not event.strip()
     ):
-        logger.warning("Ignoring Gate event with invalid source fields: %s", payload)
+        logger.warning(
+            "Ignoring Gate event with invalid "
+            "source fields: %s",
+            payload,
+        )
         return None
     db = SessionLocal()
+
     try:
         supplied_id = payload.get("event_id")
         event_id = (
             supplied_id.strip()
-            if isinstance(supplied_id, str) and supplied_id.strip()
+            if (
+                isinstance(supplied_id, str)
+                and supplied_id.strip()
+            )
             else f"backend-{secrets.token_urlsafe(18)}"
         )
-        if db.query(GateEvent.id).filter(GateEvent.event_id == event_id).first():
-            return None
+        existing_event = (
+            db.query(GateEvent)
+            .filter(GateEvent.event_id == event_id)
+            .first()
+        )
+        if existing_event is not None:
+            if existing_event.payload != payload:
+                logger.warning(
+                    "Gate event_id collision with "
+                    "different payload: %s",
+                    event_id,
+                )
+                return None
+
+            return event_id, False
+
         raw_command_id = payload.get("command_id")
         command_id = (
             raw_command_id.strip()
-            if isinstance(raw_command_id, str) and raw_command_id.strip()
+            if (
+                isinstance(raw_command_id, str)
+                and raw_command_id.strip()
+            )
             else None
         )
         raw_code = payload.get("booking_code")
         booking_code = (
             raw_code.strip()
-            if isinstance(raw_code, str) and raw_code.strip()
+            if (
+                isinstance(raw_code, str)
+                and raw_code.strip()
+            )
             else None
         )
         command = None
         booking = None
+
         if command_id is not None:
             command = (
                 db.query(HardwareCommand)
-                .filter(HardwareCommand.command_id == command_id)
+                .filter(
+                    HardwareCommand.command_id ==
+                    command_id
+                )
                 .first()
             )
             if (
                 command is None
                 or command.device_name != "esp32_cam"
-                or (command.gate != gate and command.gate != "admin")
+                or (
+                    command.gate != gate
+                    and command.gate != "admin"
+                )
             ):
-                logger.warning("Gate event has unknown or mismatched command_id")
+                logger.warning(
+                    "Gate event has unknown or "
+                    "mismatched command_id"
+                )
                 return None
+
             if command.booking_id is not None:
                 booking = (
                     db.query(Booking)
-                    .filter(Booking.id == command.booking_id)
+                    .filter(
+                        Booking.id ==
+                        command.booking_id
+                    )
                     .first()
                 )
             if booking_code is not None and (
-                booking is None or booking.booking_code != booking_code
+                booking is None
+                or booking.booking_code != booking_code
             ):
-                logger.warning("Gate event booking_code and command_id disagree")
+                logger.warning(
+                    "Gate event booking_code and "
+                    "command_id disagree"
+                )
                 return None
+
         elif booking_code is not None:
             booking = (
                 db.query(Booking)
-                .filter(Booking.booking_code == booking_code)
+                .filter(
+                    Booking.booking_code ==
+                    booking_code
+                )
                 .first()
             )
-        db.add(GateEvent(
-            event_id=event_id,
-            device_name=device_name,
-            gate=gate,
-            sensor=sensor,
-            event=event,
-            command_id=command_id,
-            booking_id=booking.id if booking is not None else None,
-            payload=payload,
-            received_at=datetime.now(timezone.utc),
-        ))
+        db.add(
+            GateEvent(
+                event_id=event_id,
+                device_name=device_name,
+                gate=gate,
+                sensor=sensor,
+                event=event,
+                command_id=command_id,
+                booking_id=(
+                    booking.id
+                    if booking is not None
+                    else None
+                ),
+                payload=payload,
+                received_at=datetime.now(
+                    timezone.utc
+                ),
+            )
+        )
         db.commit()
-        return event_id
+        return event_id, True
+    
     except Exception:
         db.rollback()
-        logger.exception("Unable to persist Gate event")
+        logger.exception(
+            "Unable to persist Gate event"
+        )
         return None
+
     finally:
         db.close()
 
@@ -2326,11 +2427,13 @@ def _record_gate_event_action(
     source: str,
     sensor: str | None = None,
     sensor_device: str | None = None,
-) -> None:
+) -> bool:
     db = SessionLocal()
     reassert_command: HardwareCommand | None = None
+    processed = False
     try:
         now = datetime.now(timezone.utc)
+
         _set_gate_state(
             db=db,
             action=action,
@@ -2383,28 +2486,47 @@ def _record_gate_event_action(
             ),
             source="esp32_cam",
         )
-        admin_command = _latest_admin_servo_command(db, now)
+        admin_command = _latest_admin_servo_command(
+            db,
+            now,
+        )
         if (
             admin_command is not None
             and admin_command.status == "acknowledged"
             and admin_command.action != action
         ):
             _record_hardware_log(
-                db, "servo", "admin_conflict",
-                f"Observed {action} while Admin requested {admin_command.action}",
-                admin_command.command_id, "esp32_cam",
+                db,
+                "servo",
+                "admin_conflict",
+                (
+                    f"Observed {action} while Admin requested "
+                    f"{admin_command.action}"
+                ),
+                admin_command.command_id,
+                "esp32_cam",
             )
             reassert_command = _queue_servo_command(
-                db, None, None, "admin", admin_command.action, source="admin"
+                db,
+                None,
+                None,
+                "admin",
+                admin_command.action,
+                source="admin",
             )
-            _stamp_admin_override(reassert_command, now)
+            _stamp_admin_override(
+                reassert_command,
+                now,
+            )
         db.commit()
+        processed = True
 
         if reassert_command is not None:
             db.refresh(reassert_command)
     except Exception:
         db.rollback()
         reassert_command = None
+
         logger.exception(
             "Unable to record gate event action %s from %s",
             action,
@@ -2412,8 +2534,10 @@ def _record_gate_event_action(
         )
     finally:
         db.close()
+
     if reassert_command is not None:
         _publish_servo_command(reassert_command)
+    return processed
 
 def _finish_hardware_command(
     db: Session,
@@ -3491,7 +3615,7 @@ def _queue_normal_gate_open_after_verified_qr(
     )
     if matched_event is None:
         return "waiting_for_vehicle", None
-
+    
     command = _queue_servo_command(
         db=db,
         booking=booking,
@@ -3504,7 +3628,6 @@ def _queue_normal_gate_open_after_verified_qr(
 
     matched_event.booking_id = booking.id
     matched_event.command_id = command.command_id
-
     return "queued", command
 
 def _complete_passage_after_ir(
@@ -3512,11 +3635,15 @@ def _complete_passage_after_ir(
     booking_code: str | None,
     command_id: str | None,
     event_id: str,
-) -> None:
+) -> bool:
     if gate not in {"entry", "exit"} or not command_id:
-        logger.warning("Ignoring %s passage without an exact open command", gate)
-        return
+        logger.warning(
+            "Ignoring %s passage without an exact open command",
+            gate,
+        )
+        return False
     db = SessionLocal()
+
     try:
         now = datetime.now(timezone.utc)
         command = (
@@ -3527,53 +3654,91 @@ def _complete_passage_after_ir(
                 HardwareCommand.action == "open",
                 HardwareCommand.source == f"{gate}_ir_pair",
                 HardwareCommand.device_name == "esp32_cam",
-                HardwareCommand.status.in_((
-                    "queued", "acknowledged", "no_response", "superseded"
-                )),
+                HardwareCommand.status.in_(
+                    (
+                        "queued",
+                        "acknowledged",
+                        "no_response",
+                        "superseded",
+                    )
+                ),
                 HardwareCommand.booking_id.is_not(None),
                 HardwareCommand.qr_token_id.is_not(None),
             )
             .first()
         )
         if command is None:
-            logger.warning("IR passage has no matching normal-open command: %s", command_id)
-            return
-        if command.status == "superseded" and command.published_at is None:
-            return
+            logger.warning(
+                "IR passage has no matching normal-open command: %s",
+                command_id,
+            )
+            return False
+
+        if (
+            command.status == "superseded"
+            and command.published_at is None
+        ):
+            return True
+
         booking = (
             db.query(Booking)
-            .filter(Booking.id == command.booking_id)
+            .filter(
+                Booking.id == command.booking_id,
+            )
             .with_for_update()
             .first()
-        )
+        ) 
         qr_token = (
             db.query(BookingQrToken)
-            .filter(BookingQrToken.id == command.qr_token_id)
+            .filter(
+                BookingQrToken.id == command.qr_token_id,
+            )
             .first()
         )
         if (
-            booking is None or qr_token is None
+            booking is None
+            or qr_token is None
             or qr_token.booking_id != booking.id
             or qr_token.qr_type != gate
             or qr_token.used_at is None
             or qr_token.revoked_at is not None
-            or (booking_code is not None and booking_code != booking.booking_code)
+            or (
+                booking_code is not None
+                and booking_code != booking.booking_code
+            )
         ):
-            logger.warning("IR passage and scanned QR do not match")
-            return
+            logger.warning(
+                "IR passage and scanned QR do not match"
+            )
+            return False
+
         if gate == "entry":
+            if booking.entered_at is not None:
+                return True
             if (
                 booking.status != "active"
-                or booking.entered_at is not None
-                or _booking_is_past_no_show_deadline(booking, now)
+                or _booking_is_past_no_show_deadline(
+                    booking,
+                    now,
+                )
             ):
-                return
+                return True
+
             booking.entered_at = now
             event_name = "booking_entered"
+
         else:
+            if (
+                booking.status == "completed"
+                and booking.exited_at is not None
+            ):
+                return True
+
             payment = (
                 db.query(Payment)
-                .filter(Payment.booking_id == booking.id)
+                .filter(
+                    Payment.booking_id == booking.id,
+                )
                 .first()
             )
             if (
@@ -3581,31 +3746,79 @@ def _complete_passage_after_ir(
                 or payment is None
                 or payment.status != "paid"
             ):
-                return
+                return False
+
             booking.status = "completed"
             booking.exited_at = now
+
             _record_slot_status(
-                db, booking.slot, SlotStatus.available, "exit_ir6", now
+                db,
+                booking.slot,
+                SlotStatus.available,
+                "exit_ir6",
+                now,
             )
             event_name = "booking_completed"
-        db.query(GateEvent).filter(GateEvent.event_id == event_id).update(
-            {GateEvent.booking_id: booking.id}, synchronize_session=False
+        (
+            db.query(GateEvent)
+            .filter(
+                GateEvent.event_id == event_id,
+            )
+            .update(
+                {
+                    GateEvent.booking_id: booking.id,
+                },
+                synchronize_session=False,
+            )
         )
         db.commit()
+
         if gate == "exit":
-            _publish_slot_command(booking.slot.name, "available", source="exit_ir6")
-            schedule_slot_broadcast(booking.slot.name, "available")
-        schedule_booking_broadcast(booking.user_id, booking.id, event_name)
+            _publish_slot_command(
+                booking.slot.name,
+                "available",
+                source="exit_ir6",
+            )
+            schedule_slot_broadcast(
+                booking.slot.name,
+                "available",
+            )
+        schedule_booking_broadcast(
+            booking.user_id,
+            booking.id,
+            event_name,
+        )
+        return True
+
     except Exception:
         db.rollback()
-        logger.exception("Unable to record %s passage for %s", gate, command_id)
+        logger.exception(
+            "Unable to record %s passage for %s",
+            gate,
+            command_id,
+        )
+        return False
+
     finally:
         db.close()
 
-def _handle_gate_pair(gate: str, sensor: str, payload: dict) -> None:
-    pair = ("IR1", "IR2") if gate == "entry" else ("IR4", "IR5")
-    expected_device = "esp32_cam" if gate == "entry" else "esp32_cam_exit"
+def _handle_gate_pair(
+    gate: str,
+    sensor: str,
+    payload: dict,
+) -> bool:
+    pair = (
+        ("IR1", "IR2")
+        if gate == "entry"
+        else ("IR4", "IR5")
+    )
+    expected_device = (
+        "esp32_cam"
+        if gate == "entry"
+        else "esp32_cam_exit"
+    )
     device_name = payload.get("device")
+
     if device_name != expected_device:
         logger.warning(
             "Ignoring %s pair event from %s; expected %s",
@@ -3613,10 +3826,14 @@ def _handle_gate_pair(gate: str, sensor: str, payload: dict) -> None:
             device_name,
             expected_device,
         )
-        return
+        return False
 
-    simultaneous_pair = _gate_pair_confirmed(gate, payload)
+    simultaneous_pair = _gate_pair_confirmed(
+        gate,
+        payload,
+    )
     db = SessionLocal()
+
     try:
         now = datetime.now(timezone.utc)
         _record_device_observation(
@@ -3628,29 +3845,47 @@ def _handle_gate_pair(gate: str, sensor: str, payload: dict) -> None:
             processed=True,
         )
         _record_device_observation(
-            db, sensor.lower(), "online", f"Gate sensor triggered: {sensor}", now,
+            db,
+            sensor.lower(),
+            "online",
+            f"Gate sensor triggered: {sensor}",
+            now,
             processed=True,
         )
         if simultaneous_pair:
-            other_sensor = pair[1] if sensor == pair[0] else pair[0]
+            other_sensor = (
+                pair[1]
+                if sensor == pair[0]
+                else pair[0]
+            )
             _record_device_observation(
-                db, other_sensor.lower(), "online",
-                f"Gate pair confirmed with {sensor}", now,
+                db,
+                other_sensor.lower(),
+                "online",
+                f"Gate pair confirmed with {sensor}",
+                now,
                 processed=True,
             )
         db.commit()
+
     except Exception:
         db.rollback()
-        logger.exception("Unable to pair gate sensors at %s", gate)
-        return
+
+        logger.exception(
+            "Unable to pair gate sensors at %s",
+            gate,
+        )
+        return False
+
     finally:
         db.close()
     if not simultaneous_pair:
-        return
+        return True
     logger.info(
         "%s IR pair confirmed; waiting for the user's QR scan",
         gate,
     )
+    return True
 
 def _handle_gate_event(payload: dict) -> None:
     event = payload.get("event")
@@ -3666,13 +3901,19 @@ def _handle_gate_event(payload: dict) -> None:
     )
     entry_pair = (
         device_name == "esp32_cam"
-        and event in {"sensor_triggered", "vehicle_detected"}
+        and event in {
+            "sensor_triggered",
+            "vehicle_detected",
+        }
         and gate == "entry"
         and sensor in {"IR1", "IR2"}
     )
     exit_pair = (
         device_name == "esp32_cam_exit"
-        and event in {"sensor_triggered", "vehicle_detected"}
+        and event in {
+            "sensor_triggered",
+            "vehicle_detected",
+        }
         and gate == "exit"
         and sensor in {"IR4", "IR5"}
     )
@@ -3687,30 +3928,89 @@ def _handle_gate_event(payload: dict) -> None:
         and event == "gate_closed"
         and (gate, sensor) == ("exit", "IR6")
     )
-    if not (entry_boot or entry_pair or exit_pair or entry_passage or exit_passage):
-        logger.warning("Ignoring unsupported gate event: %s", payload)
+    if not (
+        entry_boot
+        or entry_pair
+        or exit_pair
+        or entry_passage
+        or exit_passage
+    ):
+        logger.warning(
+            "Ignoring unsupported gate event: %s",
+            payload,
+        )
         return
-    
-    event_id = _record_gate_event(payload)
-    if event_id is None:
+
+    recorded_event = _record_gate_event(payload)
+
+    if recorded_event is None:
         return
+    event_id, _ = recorded_event
+    processed = False
+
     if entry_boot:
-        _record_gate_event_action(action="close", source="boot")
+        processed = _record_gate_event_action(
+            "closed",
+            "firmware_boot",
+            sensor=sensor,
+        )
+    elif entry_pair:
+        processed = _handle_gate_pair(
+            "entry",
+            sensor,
+            payload,
+        )
+    elif exit_pair:
+        processed = _handle_gate_pair(
+            "exit",
+            sensor,
+            payload,
+        )
+    elif entry_passage:
+        action_recorded = _record_gate_event_action(
+            "closed",
+            "entry_ir3",
+            sensor=sensor,
+        )
+        passage_completed = _complete_passage_after_ir(
+            "entry",
+            payload.get("booking_code"),
+            payload.get("command_id"),
+            event_id,
+        )
+        processed = (
+            action_recorded
+            and passage_completed
+        )
+    elif exit_passage:
+        action_recorded = _record_gate_event_action(
+            "closed",
+            "exit_ir6",
+            sensor=sensor,
+            sensor_device=sensor_device,
+        )
+        passage_completed = _complete_passage_after_ir(
+            "exit",
+            payload.get("booking_code"),
+            payload.get("command_id"),
+            event_id,
+        )
+        processed = (
+            action_recorded
+            and passage_completed
+        )
+    if not processed:
+        logger.warning(
+            "Gate event %s was persisted but not fully processed; "
+            "Firmware will retry because no ACK was sent",
+            event_id,
+        )
         return
-    if entry_pair or exit_pair:
-        _handle_gate_pair(gate, sensor, payload)
-        return
-    booking_code = payload.get("booking_code")
-    command_id = payload.get("command_id")
-    booking_code = booking_code.strip() if isinstance(booking_code, str) and booking_code.strip() else None
-    command_id = command_id.strip() if isinstance(command_id, str) and command_id.strip() else None
-    _record_gate_event_action(
-        action="close",
-        source=f"{gate}_{sensor.lower()}",
-        sensor=sensor,
-        sensor_device="esp32_cam_exit" if exit_passage else None,
+
+    _publish_gate_event_ack(
+        event_id,
+        device_name,
     )
-    _complete_passage_after_ir(gate, booking_code, command_id, event_id)
 
 def _scan_page(
     title: str,
@@ -3903,17 +4203,31 @@ def _validate_vehicle_specs(
     if len(vehicle_specs) > MAX_VEHICLES_PER_USER:
         raise HTTPException(
             status_code=422,
-            detail="A user may register up to 5 vehicles",
+            detail=(
+                "ผู้ใช้งานสามารถลงทะเบียนรถได้สูงสุด 5 คัน"
+            ),
         )
-    normalized_specs: list[tuple[str, str]] = []
-    registered_vehicles: set[tuple[str, str]] = set()
+    normalized_specs: list[
+        tuple[str, str]
+    ] = []
+    registered_vehicles: set[
+        tuple[str, str]
+    ] = set()
     for plate_number, province in vehicle_specs:
         cleaned_plate_number = plate_number.strip()
         cleaned_province = province.strip()
+
         if not cleaned_plate_number:
             raise HTTPException(
                 status_code=422,
-                detail="Vehicle plate number is required",
+                detail="กรุณากรอกทะเบียนรถ",
+            )
+        if not cleaned_province:
+            raise HTTPException(
+                status_code=422,
+                detail=(
+                    "กรุณากรอกจังหวัดของทะเบียนรถ"
+                ),
             )
         vehicle_key = (
             cleaned_plate_number.casefold(),
@@ -3922,11 +4236,16 @@ def _validate_vehicle_specs(
         if vehicle_key in registered_vehicles:
             raise HTTPException(
                 status_code=422,
-                detail="Duplicate vehicle information",
+                detail=(
+                    "มีทะเบียนรถและจังหวัดซ้ำกัน"
+                ),
             )
         registered_vehicles.add(vehicle_key)
         normalized_specs.append(
-            (cleaned_plate_number, cleaned_province)
+            (
+                cleaned_plate_number,
+                cleaned_province,
+            )
         )
     return normalized_specs
 

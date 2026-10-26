@@ -25,15 +25,32 @@ class VehicleInput(RequestModel):
 
     @field_validator("plate_number")
     @classmethod
-    def plate_number_must_not_be_blank(cls, value: str) -> str:
-        cleaned_value = value.strip()
-        if not cleaned_value:
+    def normalize_plate_number(
+        cls,
+        value: str,
+    ) -> str:
+        compact = re.sub(
+            r"[\s-]+",
+            "",
+            value.strip().upper(),
+        )
+        if not compact:
             raise ValueError("กรุณากรอกทะเบียนรถ")
-        return cleaned_value
-
+        match = re.fullmatch(
+            r"(.+?)(\d{1,4})",
+            compact,
+        )
+        if match is None:
+            raise ValueError(
+                "ทะเบียนรถต้องมีขีด เช่น กข-1234"
+            )
+        return f"{match.group(1)}-{match.group(2)}"
     @field_validator("province")
     @classmethod
-    def normalize_optional_province(cls, value: str) -> str:
+    def normalize_optional_province(
+        cls,
+        value: str,
+    ) -> str:
         return value.strip()
 
 class VehicleOut(OutputModel):
@@ -65,17 +82,30 @@ class UserCreate(RequestModel):
         if not cleaned_value:
             raise ValueError("กรุณากรอกชื่อผู้ใช้งาน")
         return cleaned_value
-
+    
     @model_validator(mode="after")
     def passwords_must_match(self):
         if self.password != self.password_confirmation:
             raise ValueError("รหัสผ่านไม่ตรงกัน")
         return self
+    
+    @model_validator(mode="after")
+    def registered_vehicles_must_have_province(self):
+        for vehicle in self.vehicles or []:
+            if not vehicle.province:
+                raise ValueError("กรุณากรอกจังหวัดของทะเบียนรถ")
+        return self
 
 class UserUpdate(RequestModel):
     username: Optional[str] = None
-    password: Optional[str] = Field(default=None, min_length=8)
-    password_confirmation: Optional[str] = Field(default=None, min_length=8)
+    password: Optional[str] = Field(
+        default=None,
+        min_length=8,
+    )
+    password_confirmation: Optional[str] = Field(
+        default=None,
+        min_length=8,
+    )
     license_plate: Optional[str] = None
     vehicles: Optional[List[VehicleInput]] = None
 
@@ -88,21 +118,41 @@ class UserUpdate(RequestModel):
         if value is None:
             return None
         cleaned_value = value.strip()
+
         if not cleaned_value:
-            raise ValueError("กรุณากรอกชื่อผู้ใช้งาน")
+            raise ValueError(
+                "กรุณากรอกชื่อผู้ใช้งาน"
+            )
         return cleaned_value
 
     @model_validator(mode="after")
     def password_confirmation_must_match(self):
-        if self.password is None and self.password_confirmation is not None:
+        if (
+            self.password is None
+            and self.password_confirmation is not None
+        ):
             raise ValueError(
                 "ส่ง password_confirmation ได้เมื่อเปลี่ยนรหัสผ่านเท่านั้น"
             )
         if (
             self.password is not None
-            and self.password != self.password_confirmation
+            and self.password !=
+                self.password_confirmation
         ):
-            raise ValueError("รหัสผ่านไม่ตรงกัน")
+            raise ValueError(
+                "รหัสผ่านไม่ตรงกัน"
+            )
+        return self
+    
+    @model_validator(mode="after")
+    def updated_vehicles_must_have_province(
+        self,
+    ):
+        for vehicle in self.vehicles or []:
+            if not vehicle.province:
+                raise ValueError(
+                    "กรุณากรอกจังหวัดของทะเบียนรถ"
+                )
         return self
     
 class UserOut(OutputModel):
