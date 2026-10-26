@@ -1593,6 +1593,7 @@ def _build_mqtt_client() -> mqtt.Client:
             ssl.create_default_context(),
         )
     client.on_connect = on_mqtt_connect
+    client.on_connect_fail = on_mqtt_connect_fail
     client.on_disconnect = on_mqtt_disconnect
     client.on_message = on_mqtt_message
     return client
@@ -2872,13 +2873,14 @@ def _publish_hardware_command(
             return False
     finally:
         db.close()
-    if not mqtt_client.is_connected():
-        _mark_hardware_command_failed(
-            command_id,
-            "MQTT broker is not connected; hardware command was not sent",
-        )
-        return False
-    
+        if not mqtt_client.is_connected():
+            logger.warning(
+                "MQTT not connected; command %s stays queued and will be "
+                "sent automatically after reconnect",
+                command_id,
+            )
+            return False
+        
     try:
         result = mqtt_client.publish(
             topic,
