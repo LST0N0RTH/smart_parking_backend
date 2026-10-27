@@ -1189,7 +1189,6 @@ async def lifespan(app: FastAPI):
         asyncio.create_task(monitor_hardware_command_timeouts()),
         asyncio.create_task(retry_unpublished_hardware_commands()),
         asyncio.create_task(monitor_device_liveness()),
-        asyncio.create_task(expire_admin_rgb_overrides()),
     ]
 
     try:
@@ -2124,64 +2123,6 @@ async def monitor_device_liveness() -> None:
         finally:
             db.close()
 
-async def expire_admin_rgb_overrides() -> None:
-    while True:
-        await asyncio.sleep(15)
-        db = SessionLocal()
-        restored: list[tuple[str, str]] = []
-        try:
-            now = datetime.now(timezone.utc)
-            day_start = _bangkok_day_start(now)
-            for slot in db.query(Slot).with_for_update().all():
-                if _latest_admin_rgb_command(db, slot.name, now) is not None:
-                    continue
-                last = (
-                    db.query(SlotStatusLog)
-                    .filter(SlotStatusLog.slot_id == slot.id)
-                    .order_by(
-                        SlotStatusLog.recorded_at.desc(),
-                        SlotStatusLog.id.desc(),
-                    )
-                    .first()
-                )
-                if (
-                    last is None
-                    or not last.source.startswith("admin:")
-                    or _utc_datetime(last.recorded_at) >= day_start
-                ):
-                    continue
-                live = (
-                    db.query(Booking)
-                    .filter(
-                        Booking.slot_id == slot.id,
-                        Booking.status.in_(("active", "ready_to_exit")),
-                    )
-                    .first()
-                )
-                target = (
-                    SlotStatus.occupied if live and live.entered_at is not None
-                    else SlotStatus.reserved if live else SlotStatus.available
-                )
-                slot.status = target
-                db.add(SlotStatusLog(
-                    slot_id=slot.id,
-                    status=target,
-                    source="admin_expired",
-                    recorded_at=now,
-                ))
-                restored.append((slot.name, target.value))
-            if restored:
-                db.commit()
-        except Exception:
-            db.rollback()
-            logger.exception("Unable to expire Admin RGB overrides")
-            restored = []
-        finally:
-            db.close()
-        for slot_name, status in restored:
-            _publish_slot_command(slot_name, status, source="admin_expired")
-            schedule_slot_broadcast(slot_name, status)
-
 def _record_slot_status(
     db: Session,
     slot: Slot,
@@ -2435,6 +2376,7 @@ def _set_gate_state_from_hardware_command(
         command_id=command.command_id,
         now=now,
     )
+
 def _record_gate_event_action(
     action: str,
     source: str,
@@ -2442,8 +2384,7 @@ def _record_gate_event_action(
     sensor_device: str | None = None,
 ) -> bool:
     db = SessionLocal()
-    reassert_command: HardwareCommand | None = None
-    processed = False
+
     try:
         now = datetime.now(timezone.utc)
 
@@ -2499,58 +2440,45 @@ def _record_gate_event_action(
             ),
             source="esp32_cam",
         )
-        admin_command = _latest_admin_servo_command(
-            db,
-            now,
+        stale_admin_commands = (
+            db.query(HardwareCommand)
+            .filter(
+                HardwareCommand.device_name == "esp32_cam",
+                HardwareCommand.source == "admin",
+                HardwareCommand.action.in_(("open", "close")),
+                HardwareCommand.action != action,
+                HardwareCommand.status.in_(("queued", "failed", "no_response")),
+            )
+            .with_for_update()
+            .all()
         )
-        if (
-            admin_command is not None
-            and admin_command.status == "acknowledged"
-            and admin_command.action != action
-        ):
+        for command in stale_admin_commands:
+            command.status = "superseded"
             _record_hardware_log(
                 db,
                 "servo",
-                "admin_conflict",
+                "superseded",
                 (
-                    f"Observed {action} while Admin requested "
-                    f"{admin_command.action}"
+                    "A physical gate event superseded the pending "
+                    f"Admin command: {command.command_id}"
                 ),
-                admin_command.command_id,
+                command.command_id,
                 "esp32_cam",
             )
-            reassert_command = _queue_servo_command(
-                db,
-                None,
-                None,
-                "admin",
-                admin_command.action,
-                source="admin",
-            )
-            _stamp_admin_override(
-                reassert_command,
-                now,
-            )
         db.commit()
-        processed = True
+        return True
 
-        if reassert_command is not None:
-            db.refresh(reassert_command)
     except Exception:
         db.rollback()
-        reassert_command = None
-
         logger.exception(
             "Unable to record gate event action %s from %s",
             action,
             source,
         )
+        return False
+
     finally:
         db.close()
-
-    if reassert_command is not None:
-        _publish_servo_command(reassert_command)
-    return processed
 
 def _finish_hardware_command(
     db: Session,
@@ -2730,48 +2658,11 @@ def _handle_hardware_ack(payload: dict) -> None:
         if command.status not in {"queued", "failed", "no_response"}:
             return
         now = datetime.now(timezone.utc)
-
-        if (
-            (command.source == "admin" or command.source.startswith("admin:"))
-            and command.created_at is not None
-            and _utc_datetime(command.created_at) < _bangkok_day_start(now)
-        ):
-            command.status = "superseded"
-            db.commit()
-            return
-        
-        auto_servo = (
-            command.device_name == "esp32_cam"
-            and command.source != "admin"
-            and command.action in {"open", "close"}
-            and _latest_admin_servo_command(db, now) is not None
-        )
         slot_name = (
             (command.payload or {}).get("slot")
             if command.gate == "slot"
             else None
         )
-        auto_rgb = (
-            isinstance(slot_name, str)
-            and not command.source.startswith("admin:")
-            and _latest_admin_rgb_command(db, slot_name, now) is not None
-        )
-        if auto_servo or auto_rgb:
-            command.status = "superseded"
-            command.result = payload
-            command.result_received_at = now
-
-            _record_hardware_log(
-                db,
-                command.device_name,
-                "superseded",
-                f"ACK arrived after Admin override: {command.command_id}",
-                command.command_id,
-                command.source,
-            )
-            db.commit()
-            return
-
         _finish_hardware_command(
             db=db,
             command=command,
@@ -2820,7 +2711,6 @@ async def monitor_hardware_command_timeouts() -> None:
                 .with_for_update()
                 .all()
             )
-
             for command in commands:
                 _finish_hardware_command(
                     db=db,
@@ -2904,9 +2794,12 @@ def _publish_hardware_command(
     return True
 
 def _command_retry_topic(
-    db: Session, command: HardwareCommand, now: datetime,
+    db: Session,
+    command: HardwareCommand,
+    now: datetime,
 ) -> str | None:
     payload = command.payload
+
     if not isinstance(payload, dict):
         return None
     if command.gate == "slot":
@@ -2914,42 +2807,46 @@ def _command_retry_topic(
         if not isinstance(slot_name, str):
             return None
         if command.source.startswith("admin:"):
-            latest = _latest_admin_rgb_command(db, slot_name, now)
-            if latest is None or latest.id != command.id:
-                return None
-        else:
-            slot = db.query(Slot).filter(Slot.name == slot_name).first()
-            if (
-                slot is None
-                or slot.status.value != payload.get("status")
-                or _latest_admin_rgb_command(db, slot_name, now) is not None
-            ):
-                return None
+            return (
+                f"parking/slot/{slot_name}/command"
+                if command.status == "queued"
+                else None
+            )
+        slot = db.query(Slot).filter(Slot.name == slot_name).first()
+
+        if slot is None or slot.status.value != payload.get("status"):
+            return None
+
         return f"parking/slot/{slot_name}/command"
+
     if command.device_name != "esp32_cam":
         return None
     if command.source == "admin":
-        latest = _latest_admin_servo_command(db, now)
-        if latest is None or latest.id != command.id:
-            return None
-        return "parking/servo/command"
+        return (
+            "parking/servo/command"
+            if command.status == "queued"
+            else None
+        )
     if command.gate not in {"entry", "exit"}:
         return None
-    if _latest_admin_servo_command(db, now) is not None:
-        return None
-    booking = db.query(Booking).filter(Booking.id == command.booking_id).first()
+
+    booking = db.query(Booking).filter(
+        Booking.id == command.booking_id
+    ).first()
     qr_token = db.query(BookingQrToken).filter(
         BookingQrToken.id == command.qr_token_id
     ).first()
+
     if (
-        booking is None or qr_token is None
+        booking is None
+        or qr_token is None
         or qr_token.booking_id != booking.id
         or qr_token.qr_type != command.gate
         or qr_token.used_at is None
         or qr_token.revoked_at is not None
     ):
         return None
-    
+
     if command.gate == "entry":
         if (
             booking.status != "active"
@@ -2957,6 +2854,7 @@ def _command_retry_topic(
             or _booking_is_past_no_show_deadline(booking, now)
         ):
             return None
+
         if (
             command.action == "open"
             and now < _entry_qr_available_from(booking)
@@ -2982,6 +2880,7 @@ def _command_retry_topic(
         and command.source == f"{command.gate}_ir_pair"
     ):
         return "parking/servo/command"
+
     return None
 
 async def retry_unpublished_hardware_commands() -> None:
@@ -3010,6 +2909,14 @@ async def retry_unpublished_hardware_commands() -> None:
                 .all()
             )
             for command in commands:
+                if (
+                    (
+                        command.source == "admin"
+                        or command.source.startswith("admin:")
+                    )
+                    and command.status in {"failed", "no_response"}
+                ):
+                    continue
                 topic = _command_retry_topic(db, command, now)
                 if topic is None:
                     command.status = "superseded"
@@ -3175,13 +3082,35 @@ def _publish_slot_command(
     db = SessionLocal()
 
     try:
-        if (
-            not source.startswith("admin:")
-            and _latest_admin_rgb_command(
-                db, slot_name, datetime.now(timezone.utc)
-            ) is not None
-        ):
-            return
+        pending_commands = (
+            db.query(HardwareCommand)
+            .filter(
+                HardwareCommand.gate == "slot",
+                HardwareCommand.device_name == "esp32_wroom",
+                HardwareCommand.action == "set_status",
+                HardwareCommand.status.in_(("queued", "failed", "no_response")),
+            )
+            .with_for_update()
+            .all()
+        )
+        for old_command in pending_commands:
+            payload = old_command.payload or {}
+            if (
+                isinstance(payload, dict)
+                and payload.get("slot") == slot_name
+            ):
+                old_command.status = "superseded"
+                _record_hardware_log(
+                    db,
+                    old_command.device_name,
+                    "superseded",
+                    (
+                        "A newer slot state superseded the pending command: "
+                        f"{old_command.command_id}"
+                    ),
+                    old_command.command_id,
+                    source,
+                )
         command = _queue_slot_command(
             db=db,
             slot_name=slot_name,
@@ -3190,6 +3119,7 @@ def _publish_slot_command(
         )
         db.commit()
         db.refresh(command)
+
     except Exception:
         db.rollback()
         logger.exception(
@@ -3300,9 +3230,6 @@ def _handle_slot_vision_update(payload: dict) -> None:
                 )
                 continue
 
-            if _latest_admin_rgb_command(db, slot_name, now) is not None:
-                continue
-
             live_booking = (
                 db.query(Booking)
                 .filter(
@@ -3371,49 +3298,28 @@ def _replay_slot_states_to_wroom() -> None:
     db = SessionLocal()
 
     try:
-        now = datetime.now(timezone.utc)
-        valid_statuses = {status.value for status in SlotStatus}
-
         slots = (
             db.query(Slot)
             .filter(Slot.name.in_(("M", "N", "O")))
             .order_by(Slot.name)
             .all()
         )
-
         for slot in slots:
-            status = slot.status.value
-            source = "backend_sync"
-
-            admin_command = _latest_admin_rgb_command(
-                db,
-                slot.name,
-                now,
-            )
-
-            if admin_command is not None:
-                payload = admin_command.payload or {}
-                admin_status = (
-                    payload.get("status")
-                    if isinstance(payload, dict)
-                    else None
+            slot_states.append(
+                (
+                    slot.name,
+                    slot.status.value,
+                    "backend_sync",
                 )
-
-                if admin_status in valid_statuses:
-                    status = admin_status
-
-                source = admin_command.source
-
-            slot_states.append((slot.name, status, source))
-
+            )
     except Exception:
         logger.exception(
             "Unable to prepare RGB state replay for ESP32-WROOM"
         )
         return
+    
     finally:
         db.close()
-
     for slot_name, status, source in slot_states:
         _publish_slot_command(slot_name, status, source=source)
 
@@ -3513,59 +3419,6 @@ def _handle_hardware_heartbeat(payload: dict) -> None:
     if replay_slot_states:
         _replay_slot_states_to_wroom()
 
-def _bangkok_day_start(now: datetime) -> datetime:
-    local_date = now.astimezone(ZoneInfo("Asia/Bangkok")).date()
-    return datetime.combine(
-        local_date, datetime.min.time(), tzinfo=ZoneInfo("Asia/Bangkok")
-    ).astimezone(timezone.utc)
-
-def _stamp_admin_override(command: HardwareCommand, now: datetime) -> None:
-    payload = dict(command.payload or {})
-    payload["priority"] = "admin"
-    payload["override_until"] = _bangkok_day_start(
-        now + timedelta(days=1)
-    ).isoformat()
-    command.payload = payload
-
-def _latest_admin_servo_command(
-    db: Session, now: datetime,
-) -> HardwareCommand | None:
-    return (
-        db.query(HardwareCommand)
-        .filter(
-            HardwareCommand.device_name == "esp32_cam",
-            HardwareCommand.source == "admin",
-            HardwareCommand.action.in_(("open", "close")),
-            HardwareCommand.created_at >= _bangkok_day_start(now),
-            HardwareCommand.status != "superseded",
-        )
-        .order_by(HardwareCommand.created_at.desc(), HardwareCommand.id.desc())
-        .first()
-    )
-
-def _latest_admin_rgb_command(
-    db: Session, slot_name: str, now: datetime,
-) -> HardwareCommand | None:
-    commands = (
-        db.query(HardwareCommand)
-        .filter(
-            HardwareCommand.device_name == "esp32_wroom",
-            HardwareCommand.gate == "slot",
-            HardwareCommand.action == "set_status",
-            HardwareCommand.source.like("admin:%"),
-            HardwareCommand.created_at >= _bangkok_day_start(now),
-            HardwareCommand.status != "superseded",
-        )
-        .order_by(HardwareCommand.created_at.desc(), HardwareCommand.id.desc())
-        .all()
-    )
-    return next(
-        (command for command in commands
-         if isinstance(command.payload, dict)
-         and command.payload.get("slot") == slot_name),
-        None,
-    )
-
 def _gate_pair_confirmed(gate: str, payload: dict) -> bool:
     if gate not in {"entry", "exit"} or payload.get("gate") != gate:
         return False
@@ -3592,8 +3445,6 @@ def _queue_normal_gate_open_after_verified_qr(
 
     if gate not in {"entry", "exit"}:
         raise ValueError("Normal gate opening requires an entry or exit QR token")
-    if _latest_admin_servo_command(db, now) is not None:
-        return "admin_override", None
 
     expected_sensors = (
         ("IR1", "IR2")
@@ -3629,7 +3480,30 @@ def _queue_normal_gate_open_after_verified_qr(
     )
     if matched_event is None:
         return "waiting_for_vehicle", None
-    
+
+    stale_admin_commands = (
+        db.query(HardwareCommand)
+        .filter(
+            HardwareCommand.device_name == "esp32_cam",
+            HardwareCommand.source == "admin",
+            HardwareCommand.status.in_(("queued", "failed", "no_response")),
+        )
+        .with_for_update()
+        .all()
+    )
+    for old_command in stale_admin_commands:
+        old_command.status = "superseded"
+        _record_hardware_log(
+            db,
+            "servo",
+            "superseded",
+            (
+                "A verified QR and IR pair superseded the pending "
+                f"Admin command: {old_command.command_id}"
+            ),
+            old_command.command_id,
+            f"{gate}_ir_pair",
+        )
     command = _queue_servo_command(
         db=db,
         booking=booking,
@@ -3907,6 +3781,7 @@ def _handle_gate_event(payload: dict) -> None:
     sensor = payload.get("sensor")
     device_name = payload.get("device")
     sensor_device = payload.get("sensor_device")
+
     entry_boot = (
         device_name == "esp32_cam"
         and event == "gate_closed"
@@ -3915,19 +3790,13 @@ def _handle_gate_event(payload: dict) -> None:
     )
     entry_pair = (
         device_name == "esp32_cam"
-        and event in {
-            "sensor_triggered",
-            "vehicle_detected",
-        }
+        and event in {"sensor_triggered", "vehicle_detected"}
         and gate == "entry"
         and sensor in {"IR1", "IR2"}
     )
     exit_pair = (
         device_name == "esp32_cam_exit"
-        and event in {
-            "sensor_triggered",
-            "vehicle_detected",
-        }
+        and event in {"sensor_triggered", "vehicle_detected"}
         and gate == "exit"
         and sensor in {"IR4", "IR5"}
     )
@@ -3942,6 +3811,7 @@ def _handle_gate_event(payload: dict) -> None:
         and event == "gate_closed"
         and (gate, sensor) == ("exit", "IR6")
     )
+
     if not (
         entry_boot
         or entry_pair
@@ -3954,7 +3824,6 @@ def _handle_gate_event(payload: dict) -> None:
             payload,
         )
         return
-
     recorded_event = _record_gate_event(payload)
 
     if recorded_event is None:
@@ -3986,16 +3855,19 @@ def _handle_gate_event(payload: dict) -> None:
             "entry_ir3",
             sensor=sensor,
         )
-        passage_completed = _complete_passage_after_ir(
-            "entry",
-            payload.get("booking_code"),
-            payload.get("command_id"),
-            event_id,
+        command_id = payload.get("command_id")
+        passage_completed = (
+            _complete_passage_after_ir(
+                "entry",
+                payload.get("booking_code"),
+                command_id,
+                event_id,
+            )
+            if isinstance(command_id, str) and command_id.strip()
+            else True
         )
-        processed = (
-            action_recorded
-            and passage_completed
-        )
+        processed = action_recorded and passage_completed
+
     elif exit_passage:
         action_recorded = _record_gate_event_action(
             "closed",
@@ -4003,16 +3875,19 @@ def _handle_gate_event(payload: dict) -> None:
             sensor=sensor,
             sensor_device=sensor_device,
         )
-        passage_completed = _complete_passage_after_ir(
-            "exit",
-            payload.get("booking_code"),
-            payload.get("command_id"),
-            event_id,
+        command_id = payload.get("command_id")
+        passage_completed = (
+            _complete_passage_after_ir(
+                "exit",
+                payload.get("booking_code"),
+                command_id,
+                event_id,
+            )
+            if isinstance(command_id, str) and command_id.strip()
+            else True
         )
-        processed = (
-            action_recorded
-            and passage_completed
-        )
+        processed = action_recorded and passage_completed
+
     if not processed:
         logger.warning(
             "Gate event %s was persisted but not fully processed; "
@@ -6538,7 +6413,6 @@ def get_gate_state(
         .filter(GateState.gate == "main")
         .first()
     )
-
     if state is None:
         return {
             "gate": "main",
@@ -6547,7 +6421,6 @@ def get_gate_state(
             "command_id": None,
             "updated_at": None,
         }
-
     return state
 
 @app.get(
@@ -6564,19 +6437,18 @@ def get_hardware_command(
         .filter(HardwareCommand.command_id == command_id)
         .first()
     )
-
     if command is None:
         raise HTTPException(404, "Hardware command not found")
 
     return command
 
 @app.post("/admin/override/servo", status_code=202)
+
 def manual_override_servo(
     body: ServoOverrideReq,
     current_admin: User = Depends(get_current_admin),
     db: Session = Depends(get_db),
 ):
-    now = datetime.now(timezone.utc)
     actor = current_admin.username or current_admin.name
     pending = (
         db.query(HardwareCommand)
@@ -6590,6 +6462,7 @@ def manual_override_servo(
     )
     for old in pending:
         old.status = "superseded"
+
     command = _queue_servo_command(
         db=db,
         booking=None,
@@ -6598,20 +6471,30 @@ def manual_override_servo(
         action=body.action,
         source="admin",
     )
-    _stamp_admin_override(command, now)
     command.detail = f"Admin {actor} requested servo {body.action}"
+
     _record_hardware_log(
-        db, "servo", "admin_override",
+        db,
+        "servo",
+        "admin_override",
         f"action={body.action} | actor={actor}",
-        command.command_id, "admin",
+        command.command_id,
+        "admin",
     )
     db.commit()
+
     published = _publish_servo_command(command)
+    if not published:
+        _mark_hardware_command_failed(
+            command.command_id,
+            "Admin servo command was not sent to the hardware",
+        )
+
     return {
         "message": (
             "Servo command sent; awaiting ESP32-CAM ACK"
-            if published else
-            "Servo command stored; continuing when connection returns"
+            if published
+            else "Servo command was not sent; check the MQTT connection and retry"
         ),
         "command_id": command.command_id,
         "status": "queued" if published else "failed",
@@ -6630,7 +6513,6 @@ def manual_override_rgb(
     )
     if slot is None:
         raise HTTPException(404, "ไม่พบช่องจอดนี้ในฐานข้อมูล")
-    now = datetime.now(timezone.utc)
     actor = current_admin.username or current_admin.name
     pending = (
         db.query(HardwareCommand)
@@ -6643,31 +6525,43 @@ def manual_override_rgb(
         .all()
     )
     for old in pending:
-        if isinstance(old.payload, dict) and old.payload.get("slot") == slot.name:
+        if (
+            isinstance(old.payload, dict)
+            and old.payload.get("slot") == slot.name
+        ):
             old.status = "superseded"
+
     command = _queue_slot_command(
         db=db,
         slot_name=slot.name,
         status=body.status.value,
         source=f"admin:{actor}",
     )
-    _stamp_admin_override(command, now)
     _record_hardware_log(
-        db, f"rgb_{slot.name.lower()}", "admin_override",
+        db,
+        f"rgb_{slot.name.lower()}",
+        "admin_override",
         f"slot={slot.name} | status={body.status.value} | actor={actor}",
-        command.command_id, "admin",
+        command.command_id,
+        "admin",
     )
     db.commit()
+
     published = _publish_hardware_command(
         command,
         f"parking/slot/{slot.name}/command",
         command.payload or {},
     )
+    if not published:
+        _mark_hardware_command_failed(
+            command.command_id,
+            "Admin RGB command was not sent to the hardware",
+        )
     return {
         "message": (
             "RGB command sent; awaiting ESP32-WROOM ACK"
-            if published else
-            "RGB command stored; continuing when connection returns"
+            if published
+            else "RGB command was not sent; check the MQTT connection and retry"
         ),
         "command_id": command.command_id,
         "status": "queued" if published else "failed",
