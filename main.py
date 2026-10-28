@@ -3445,13 +3445,12 @@ def _queue_normal_gate_open_after_verified_qr(
 
     if gate not in {"entry", "exit"}:
         raise ValueError("Normal gate opening requires an entry or exit QR token")
-
+    
     expected_sensors = (
         ("IR1", "IR2")
         if gate == "entry"
         else ("IR4", "IR5")
     )
-
     pending_events = (
         db.query(GateEvent)
         .filter(
